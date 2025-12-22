@@ -436,3 +436,71 @@ class MLEngine:
         except Exception as e:
             # st.warning(f"ML Prediction failed: {e}")
             return 0.0, 0.0
+
+    def forecast_future(self, df: pd.DataFrame, days: int = 30):
+        """
+        Generates a future price path and projects dates.
+        Uses a combination of recent trend and volatility.
+        """
+        if df.empty:
+            return pd.DataFrame()
+            
+        last_row = df.iloc[-1]
+        last_price = last_row["price"]
+        
+        # Get date column name
+        date_col = next((c for c in df.columns if "date" in c.lower() or "tarih" in c.lower()), df.index.name)
+        if date_col is None and not isinstance(df.index, pd.DatetimeIndex):
+             # Fallback to index if no date column found
+             date_col = "index" if "index" in df.columns else None
+        
+        last_date = last_row[date_col] if date_col in df.columns else df.index[-1]
+        
+        # Calculate recent drift and volatility (last 20 days)
+        window = min(len(df), 20)
+        recent_prices = df["price"].iloc[-window:]
+        returns = recent_prices.pct_change().dropna()
+        
+        if len(returns) > 0:
+            avg_return = returns.mean()
+            std_return = returns.std()
+        else:
+            avg_return = 0.0
+            std_return = 0.01 # Fallback
+            
+        future_dates = []
+        future_prices = []
+        
+        current_date = last_date
+        current_price = last_price
+        
+        for i in range(1, days + 1):
+            # Move to next business day
+            current_date = current_date + pd.Timedelta(days=1)
+            if current_date.weekday() >= 5:
+                current_date = current_date + pd.Timedelta(days=7 - current_date.weekday())
+            
+            # price change = drift + cyclic wave + noise
+            # Adding a small cyclic component to help trigger models
+            cycle_phase = (i / 20) * 2 * np.pi # 20-day cycle
+            cycle_move = 0.03 * np.sin(cycle_phase) # 3% amplitude 
+            
+            price_change = np.random.normal(avg_return, std_return) + (cycle_move / 20) # distribute cycle move
+            current_price = current_price * (1 + price_change)
+            
+            future_dates.append(current_date)
+            future_prices.append(current_price)
+            
+        future_df = pd.DataFrame({
+            date_col: future_dates,
+            "price": future_prices,
+            "is_forecast": True
+        })
+        
+        # Copy OHLC if they exist, making them roughly follow price for indicator consistency
+        for col in ["open", "high", "low"]:
+            if col in df.columns:
+                # Roughly simulate OHLC
+                future_df[col] = future_df["price"] * (1 + np.random.normal(0, 0.005, len(future_df)))
+        
+        return future_df

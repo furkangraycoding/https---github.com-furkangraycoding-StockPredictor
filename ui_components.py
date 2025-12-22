@@ -133,25 +133,48 @@ def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: p
     # AI PREDICTIONS
     # -------------------------------------------------------------
     if "AI_Dip" in df_window.columns:
-        ai_dips = df_window[df_window["AI_Dip"] == 1]
-        if not ai_dips.empty:
+        # Split into historical and forecast
+        hist_dips = df_window[(df_window["AI_Dip"] == 1) & (df_window.get("is_forecast", False) == False)]
+        fore_dips = df_window[(df_window["AI_Dip"] == 1) & (df_window.get("is_forecast", False) == True)]
+        
+        if not hist_dips.empty:
             fig.add_trace(go.Scatter(
-                x=ai_dips[date_col], y=ai_dips["price"] * 0.97,
-                mode='markers+text', name='🟢 AI BUY Tahmini',
-                text=["BUY"] * len(ai_dips), textposition="bottom center",
+                x=hist_dips[date_col], y=hist_dips["price"] * 0.97,
+                mode='markers+text', name='🟢 AI BUY Sinyali',
+                text=["BUY"] * len(hist_dips), textposition="bottom center",
                 textfont=dict(size=9, color='lime'),
                 marker=dict(color='lime', symbol='triangle-up', size=12)
             ))
+            
+        if not fore_dips.empty:
+            fig.add_trace(go.Scatter(
+                x=fore_dips[date_col], y=fore_dips["price"] * 0.97,
+                mode='markers+text', name='🌵 AI BUY (Projeksiyon)',
+                text=["PROJ"] * len(fore_dips), textposition="bottom center",
+                textfont=dict(size=9, color='#00FF00'),
+                marker=dict(color='#00FF00', symbol='triangle-up-open', size=12, line=dict(width=2))
+            ))
         
     if "AI_Peak" in df_window.columns:
-        ai_peaks = df_window[df_window["AI_Peak"] == 1]
-        if not ai_peaks.empty:
+        hist_peaks = df_window[(df_window["AI_Peak"] == 1) & (df_window.get("is_forecast", False) == False)]
+        fore_peaks = df_window[(df_window["AI_Peak"] == 1) & (df_window.get("is_forecast", False) == True)]
+        
+        if not hist_peaks.empty:
             fig.add_trace(go.Scatter(
-                x=ai_peaks[date_col], y=ai_peaks["price"] * 1.03,
-                mode='markers+text', name='🔴 AI SELL Tahmini',
-                text=["SELL"] * len(ai_peaks), textposition="top center",
+                x=hist_peaks[date_col], y=hist_peaks["price"] * 1.03,
+                mode='markers+text', name='🔴 AI SELL Sinyali',
+                text=["SELL"] * len(hist_peaks), textposition="top center",
                 textfont=dict(size=9, color='red'),
                 marker=dict(color='red', symbol='triangle-down', size=12)
+            ))
+            
+        if not fore_peaks.empty:
+            fig.add_trace(go.Scatter(
+                x=fore_peaks[date_col], y=fore_peaks["price"] * 1.03,
+                mode='markers+text', name='🌵 AI SELL (Projeksiyon)',
+                text=["PROJ"] * len(fore_peaks), textposition="top center",
+                textfont=dict(size=9, color='#FF4500'),
+                marker=dict(color='#FF4500', symbol='triangle-down-open', size=12, line=dict(width=2))
             ))
 
     fig.update_layout(

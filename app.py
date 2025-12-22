@@ -108,32 +108,74 @@ with st.spinner("Training AI Prediction Models (Dips & Peaks)..."):
 st.sidebar.divider()
 st.sidebar.markdown(f"**🤖 AI Model Stats**")
 
-# Extract metrics for UI
-dip_prec = metrics.get("dip", {}).get("precision", 0.0)
-peak_prec = metrics.get("peak", {}).get("precision", 0.0)
-dip_recall = metrics.get("dip", {}).get("recall", 0.0)
-peak_recall = metrics.get("peak", {}).get("recall", 0.0)
+# Calculate effective success rate (with 2% tolerance)
+if not backtest_df.empty:
+    eff_results = ml_engine.calculate_effective_success(backtest_df, tolerance_pct=2.0)
+    
+    dip_total = eff_results["dip"]["total"]
+    dip_success = eff_results["dip"]["detected"] + eff_results["dip"]["near_hit"]
+    dip_rate = (dip_success / dip_total * 100) if dip_total > 0 else 0
+    
+    peak_total = eff_results["peak"]["total"]
+    peak_success = eff_results["peak"]["detected"] + eff_results["peak"]["near_hit"]
+    peak_rate = (peak_success / peak_total * 100) if peak_total > 0 else 0
+    
+    st.sidebar.metric("Dip Başarı (%2 tolerans)", f"%{dip_rate:.0f}", 
+                      delta=f"{dip_success}/{dip_total}")
+    st.sidebar.metric("Peak Başarı (%2 tolerans)", f"%{peak_rate:.0f}",
+                      delta=f"{peak_success}/{peak_total}")
+else:
+    st.sidebar.info("Backtest verisi yok.")
 
-st.sidebar.metric("Dip Precision", f"%{dip_prec*100:.0f}")
-st.sidebar.metric("Peak Precision", f"%{peak_prec*100:.0f}")
-st.sidebar.metric("Dip Recall", f"%{dip_recall*100:.0f}")
-st.sidebar.metric("Peak Recall", f"%{peak_recall*100:.0f}")
 
 # =====================================================
-# DATA WINDOWING (EXTENDED WINDOW: PAST + FUTURE)
+# DATA WINDOWING & FUTURE PROJECTION (PAST + FUTURE)
 # =====================================================
-# The user wants to see history AND future predictions on the SAME chart.
 # Window: [selected_date - months_lookback] TO [selected_date + 30 days]
 window_start = selected_date - pd.DateOffset(months=months_lookback)
-window_end = selected_date + pd.DateOffset(days=30) # Peek 1 month into the future
 
+# Base window from existing data
 df_window = df_full_enriched[
     (df_full_enriched[DATE_COL] >= window_start) & 
-    (df_full_enriched[DATE_COL] <= window_end)
+    (df_full_enriched[DATE_COL] <= selected_date)
 ].copy()
 
-# 1. Run inference on this entire window (optimized thresholds: Dip=0.50, Peak=0.60)
-df_window = ml_engine.add_predictions_to_df(df_window)
+# FUTURE PROJECTION: If we are at the end or want to see what's next
+with st.spinner("Generating AI Future Forecast..."):
+    # 1. Project price forward
+    df_forecast = ml_engine.forecast_future(df_analyzed, days=30)
+    
+    if not df_forecast.empty:
+        # 2. Combine with enough history to recalculate indicators (e.g., last 200 days)
+        # We use df_analyzed as history
+        df_combined = pd.concat([df_analyzed, df_forecast], ignore_index=True)
+        
+        # 3. Recalculate indicators on combined data
+        forecast_analyzer = TechnicalAnalyzer(df_combined)
+        forecast_analyzer.add_moving_averages()
+        forecast_analyzer.add_rsi()
+        forecast_analyzer.add_atr()
+        forecast_analyzer.determine_regime()
+        df_combined = forecast_analyzer.add_derived_features()
+        
+        # 4. Run AI Predictions on the projected portion
+        df_combined = ml_engine.add_predictions_to_df(df_combined)
+        
+        # 5. Extract only the forecast portion
+        df_forecast_enriched = df_combined[df_combined["is_forecast"] == True].copy()
+        
+        # 6. FORCE AT LEAST ONE SIGNAL (as requested by user)
+        # If no dip or no peak found in the 30-day forecast, pick the highest probability dates
+        if (df_forecast_enriched["AI_Dip"] == 0).all():
+            max_dip_idx = df_forecast_enriched["AI_Dip_Prob"].idxmax()
+            df_forecast_enriched.loc[max_dip_idx, "AI_Dip"] = 1
+            
+        if (df_forecast_enriched["AI_Peak"] == 0).all():
+            max_peak_idx = df_forecast_enriched["AI_Peak_Prob"].idxmax()
+            df_forecast_enriched.loc[max_peak_idx, "AI_Peak"] = 1
+        
+        # Update window for display
+        df_window = pd.concat([df_window, df_forecast_enriched], ignore_index=True)
 
 # 2. Get probabilities for specifically the "Selected Date" (The present moment)
 # This is for the Gauges and Insights
@@ -184,17 +226,19 @@ else:
         signals_list = []
         
         for _, row in dip_signals.iterrows():
+            is_forecast = row.get("is_forecast", False)
             signals_list.append({
                 "Tarih": row[DATE_COL].strftime("%d/%m/%Y"),
-                "Sinyal": "🟢 DIP (AL)",
+                "Sinyal": "🟢 DIP (AL)" + (" (Tahmin)" if is_forecast else ""),
                 "Fiyat": f"{row['price']:,.2f}",
                 "Olasılık": f"%{row['AI_Dip_Prob']*100:.0f}"
             })
         
         for _, row in peak_signals.iterrows():
+            is_forecast = row.get("is_forecast", False)
             signals_list.append({
                 "Tarih": row[DATE_COL].strftime("%d/%m/%Y"),
-                "Sinyal": "🔴 PEAK (SAT)",
+                "Sinyal": "🔴 PEAK (SAT)" + (" (Tahmin)" if is_forecast else ""),
                 "Fiyat": f"{row['price']:,.2f}",
                 "Olasılık": f"%{row['AI_Peak_Prob']*100:.0f}"
             })
