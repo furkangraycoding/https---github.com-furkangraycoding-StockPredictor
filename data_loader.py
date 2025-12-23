@@ -31,12 +31,22 @@ def load_data(file_path: str):
     # Sort by date to ensure time-series integrity
     df = df.sort_values(date_col)
     
+    # Normalize column names
+    df.columns = [c.lower().strip() for c in df.columns]
+    
+    # Remove duplicate columns (keep first)
+    df = df.loc[:, ~df.columns.duplicated()]
+    
+    # Rename 'close' to 'price' if 'price' won't exist
+    if "close" in df.columns and "price" not in df.columns:
+        df = df.rename(columns={"close": "price"})
+        
     # Clean numeric columns (handle "1,149.03" strings)
     # We target common price/volume columns regardless of case
-    target_cols = ["price", "open", "high", "low", "close", "adj close", "vol.", "vol", "volume"]
+    target_cols = ["price", "open", "high", "low", "adj close", "vol.", "vol", "volume"]
     
     for col in df.columns:
-        if col.lower() in target_cols or col.lower() in [c.lower() for c in target_cols]:
+        if col in target_cols:
             if df[col].dtype == 'object':
                 try:
                     # Remove commas and convert to float
@@ -44,4 +54,4 @@ def load_data(file_path: str):
                 except Exception:
                     pass # unexpected format, leave as is or let downstream fail gracefully
 
-    return df, date_col
+    return df, date_col.lower()

@@ -107,7 +107,35 @@ def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: p
         fig.add_annotation(x=selected_date, y=1.02, yref="paper", text="📍", showarrow=False, font=dict(size=16))
 
     # -------------------------------------------------------------
-    # ACTUAL DIP/PEAK POINTS (Ground Truth - from Tepe/Dip columns)
+    # ZIGZAG STRUCTURE (Connect Peaks and Dips)
+    # -------------------------------------------------------------
+    # Combine Tepe and Dip into a single series for the line
+    zigzag_points = []
+    if "Tepe" in df_window.columns and "Dip" in df_window.columns:
+        # Extract potential points
+        peaks = df_window.dropna(subset=["Tepe"])[["Tepe"]]
+        peaks["type"] = "peak"
+        peaks["val"] = peaks["Tepe"]
+        
+        dips = df_window.dropna(subset=["Dip"])[["Dip"]]
+        dips["type"] = "dip"
+        dips["val"] = dips["Dip"]
+        
+        # Combine and sort index
+        zigzag_df = pd.concat([peaks, dips]).sort_index()
+        
+        if not zigzag_df.empty:
+            fig.add_trace(go.Scatter(
+                x=df_window.loc[zigzag_df.index, date_col], 
+                y=zigzag_df["val"],
+                mode='lines', 
+                name='ZigZag Structure',
+                line=dict(color='gray', width=1, dash='dash'),
+                opacity=0.5
+            ))
+
+    # -------------------------------------------------------------
+    # ACTUAL DIP/PEAK POINTS (Markers)
     # -------------------------------------------------------------
     if "Tepe" in df_window.columns:
         actual_peaks = df_window.dropna(subset=["Tepe"])
@@ -115,8 +143,8 @@ def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: p
             fig.add_trace(go.Scatter(
                 x=actual_peaks[date_col], y=actual_peaks["Tepe"],
                 mode='markers', name='⚪ Gerçek Zirve',
-                marker=dict(color='white', symbol='circle', size=10, 
-                           line=dict(width=2, color='red'))
+                marker=dict(color='white', symbol='circle', size=8, 
+                           line=dict(width=1, color='red'))
             ))
     
     if "Dip" in df_window.columns:
@@ -125,8 +153,8 @@ def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: p
             fig.add_trace(go.Scatter(
                 x=actual_dips[date_col], y=actual_dips["Dip"],
                 mode='markers', name='⚪ Gerçek Dip',
-                marker=dict(color='white', symbol='circle', size=10,
-                           line=dict(width=2, color='lime'))
+                marker=dict(color='white', symbol='circle', size=8,
+                           line=dict(width=1, color='lime'))
             ))
 
     # -------------------------------------------------------------

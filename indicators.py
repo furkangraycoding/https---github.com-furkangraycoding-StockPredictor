@@ -12,10 +12,100 @@ class TechnicalAnalyzer:
         self.df = df.copy()
         self.price_col = price_col
 
+    def add_zigzag_labels(self, threshold_pct: float = 0.05):
+        """
+        Identifies turning points using the ZigZag algorithm.
+        Also adds 'Last_Signal' state: 1 (Dip confirmed, looking for Peak), -1 (Peak confirmed, looking for Dip).
+        threshold_pct: Minimum percentage movement to change trend (0.05 = 5%).
+        """
+        if self.price_col not in self.df.columns:
+            return self.df
+            
+        prices = self.df[self.price_col].values
+        n = len(prices)
+        if n < 2:
+            return self.df
+            
+        # 1 = Up (Last was Dip), -1 = Down (Last was Peak)
+        trend = 0 
+        last_pivot_idx = 0
+        last_pivot_price = prices[0]
+        
+        self.df["Tepe"] = np.nan
+        self.df["Dip"] = np.nan
+        self.df["Last_Signal"] = 0 # 0=Unknown, 1=Dip (Bullish leg), -1=Peak (Bearish leg)
+        
+        # Initial trend detection
+        for i in range(1, n):
+            if prices[i] > last_pivot_price * (1 + threshold_pct):
+                trend = 1
+                break
+            elif prices[i] < last_pivot_price * (1 - threshold_pct):
+                trend = -1
+                break
+                
+        # ZigZag Loop
+        for i in range(1, n):
+            price = prices[i]
+            
+            if trend == 1: # Uptrend (Last confirmed was Dip)
+                if price > last_pivot_price:
+                    # New high in existing uptrend
+                    last_pivot_price = price
+                    last_pivot_idx = i
+                elif price < last_pivot_price * (1 - threshold_pct):
+                    # Reversal to downtrend -> Confirm previous PEAK
+                    self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Tepe")] = last_pivot_price
+                    # Since we just confirmed a Peak, the state becomes "Last was Peak" (-1)
+                    # BUT strictly speaking, the state *changing* happens at 'i' (confirmation point).
+                    # However, for ML labels, we want to know what the LAST confirmed point was.
+                    # We will forward fill this later, or set it here.
+                    self.df.iloc[i:, self.df.columns.get_loc("Last_Signal")] = -1
+                    
+                    trend = -1
+                    last_pivot_price = price
+                    last_pivot_idx = i
+            else: # Downtrend (Last confirmed was Peak)
+                if price < last_pivot_price:
+                    # New low in existing downtrend
+                    last_pivot_price = price
+                    last_pivot_idx = i
+                elif price > last_pivot_price * (1 + threshold_pct):
+                    # Reversal to uptrend -> Confirm previous DIP
+                    self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Dip")] = last_pivot_price
+                    self.df.iloc[i:, self.df.columns.get_loc("Last_Signal")] = 1
+                    
+                    trend = 1
+                    last_pivot_price = price
+                    last_pivot_idx = i
+        
+        # Forward fill the initial state if not set (or use 0)
+        # The loop sets it from confirmation point 'i' onwards.
+        # So we really just need to handle the very beginning.
+        
+        return self.df
+
+    def add_rolling_volatility(self, window: int = 20):
+        """Calculates annualized rolling volatility."""
+        # Log returns
+        self.df["Log_Ret"] = np.log(self.df[self.price_col] / self.df[self.price_col].shift(1))
+        # Rolling Std Dev * sqrt(252) for annualization
+        self.df["Volatility_20"] = self.df["Log_Ret"].rolling(window=window).std() * np.sqrt(252)
+        return self.df
+
+    def add_drawdown_features(self, window: int = 60):
+        """Calculates distance from recent Highs and Lows."""
+        roll_max = self.df[self.price_col].rolling(window=window, min_periods=1).max()
+        roll_min = self.df[self.price_col].rolling(window=window, min_periods=1).min()
+        
+        self.df["Drawdown_Pct"] = (self.df[self.price_col] - roll_max) / roll_max
+        self.df["Rally_Pct"] = (self.df[self.price_col] - roll_min) / roll_min
+        return self.df
+
     def add_local_extrema(self, order: int = 5):
         """
-        Identifies local peaks (Tepe) and dips (Dip) based on the given order/window.
-        Adds 'Tepe' and 'Dip' columns to the internal dataframe.
+        [DEPRECATED] Replaced by add_zigzag_labels. 
+        Kept for backward compatibility if needed, but logic should move to ZigZag.
         """
         if self.price_col not in self.df.columns:
             return self.df
@@ -99,6 +189,46 @@ class TechnicalAnalyzer:
         self.df["Regime"] = self.df.apply(classify, axis=1)
         return self.df
     
+    def add_rsi_features(self):
+        """Calculates RSI changes."""
+        if "RSI" not in self.df.columns: self.add_rsi()
+        
+        self.df["RSI_Diff_1D"] = self.df["RSI"].diff(1)
+        self.df["RSI_Diff_3D"] = self.df["RSI"].diff(3)
+        return self.df
+
+    def add_time_features(self):
+        """Calculates days since the last pivot (Dip or Peak)."""
+        # Create a combined column for any pivot date
+        # If Dip or Tepe is not NaN, we have a pivot
+        is_pivot = self.df["Dip"].notna() | self.df["Tepe"].notna()
+        
+        # We want to know the index of the last True value in is_pivot
+        # We can use forward fill on a "Last_Pivot_Idx" columns?
+        # Better: Create a 'Last_Pivot_Date' column by ffilling dates
+        
+        # Ensure we have a date column or index is date
+        date_col = next((c for c in self.df.columns if "date" in c.lower() or "tarih" in c.lower()), None)
+        if date_col:
+             dates = self.df[date_col]
+        else:
+             dates = self.df.index.to_series()
+             
+        # Series where value is Date if pivot, else NaN
+        pivot_dates = dates.where(is_pivot)
+        last_pivot_date = pivot_dates.ffill()
+        
+        # Calculate diff in days
+        # Ensure types match
+        try:
+            time_diff = (dates - last_pivot_date).dt.days
+            self.df["Days_Since_Last_Pivot"] = time_diff.fillna(0)
+        except Exception as e:
+            # Fallback for integer index or error
+            self.df["Days_Since_Last_Pivot"] = 0
+            
+        return self.df
+
     def add_derived_features(self):
         """Calculates Volatility Adjusted Momentum and other derived metrics."""
         self.add_atr(14)
@@ -117,6 +247,10 @@ class TechnicalAnalyzer:
         
         # Candle Features
         self.add_candle_features()
+        
+        # NEW: RSI & Time Features
+        self.add_rsi_features()
+        self.add_time_features()
         
         return self.df
     
