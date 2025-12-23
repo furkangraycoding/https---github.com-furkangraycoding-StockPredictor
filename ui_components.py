@@ -135,16 +135,17 @@ def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: p
             ))
 
     # -------------------------------------------------------------
-    # ACTUAL DIP/PEAK POINTS (Markers)
+    # ACTUAL DIP/PEAK POINTS (Confirmed by ZigZag)
     # -------------------------------------------------------------
+    # These are the "Official" retrospective labels
     if "Tepe" in df_window.columns:
         actual_peaks = df_window.dropna(subset=["Tepe"])
         if not actual_peaks.empty:
             fig.add_trace(go.Scatter(
                 x=actual_peaks[date_col], y=actual_peaks["Tepe"],
-                mode='markers', name='⚪ Gerçek Zirve',
-                marker=dict(color='white', symbol='circle', size=8, 
-                           line=dict(width=1, color='red'))
+                mode='markers', name='✅ Onaylı Zirve',
+                marker=dict(color='red', symbol='triangle-down', size=12, 
+                           line=dict(width=1, color='white'))
             ))
     
     if "Dip" in df_window.columns:
@@ -152,9 +153,66 @@ def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: p
         if not actual_dips.empty:
             fig.add_trace(go.Scatter(
                 x=actual_dips[date_col], y=actual_dips["Dip"],
-                mode='markers', name='⚪ Gerçek Dip',
-                marker=dict(color='white', symbol='circle', size=8,
-                           line=dict(width=1, color='lime'))
+                mode='markers', name='✅ Onaylı Dip',
+                marker=dict(color='lime', symbol='triangle-up', size=12,
+                           line=dict(width=1, color='white'))
+            ))
+
+    # -------------------------------------------------------------
+    # DETECTED TURNING POINTS (Based on State Change)
+    # -------------------------------------------------------------
+    # If official label isn't there yet, but State changed, mark it as "Detected"
+    if "Last_Signal" in df_window.columns:
+        # Find where state changes
+        sig_change = df_window["Last_Signal"].diff()
+        
+        # State changed to 1 (Dip Detected)
+        # The Dip itself was likely a few days ago (local min). 
+        # But for visualization, let's mark the "Detection Day" or find the local min.
+        dips_detected_mask = (sig_change == 2) | (sig_change == 1) # -1->1 or 0->1
+        dips_detected = df_window[dips_detected_mask]
+        
+        if not dips_detected.empty:
+             # Find actual local min in the 5 days prior to detection for better visual
+             # This is purely cosmetic to place the marker on the candle wick
+             real_dip_vals = []
+             real_dip_dates = []
+             for idx, row in dips_detected.iterrows():
+                 # Look back 5 days
+                 loc_idx = df_window.index.get_loc(idx)
+                 start_loc = max(0, loc_idx - 5)
+                 window_slice = df_window.iloc[start_loc:loc_idx+1]
+                 min_row = window_slice.loc[window_slice["low"].idxmin()]
+                 real_dip_vals.append(min_row["low"])
+                 real_dip_dates.append(min_row[date_col])
+                 
+             fig.add_trace(go.Scatter(
+                x=real_dip_dates, y=real_dip_vals,
+                mode='markers', name='🔎 Tespit Edilen Dip',
+                marker=dict(color='green', symbol='circle-open', size=10,
+                           line=dict(width=2))
+            ))
+
+        # State changed to -1 (Peak Detected)
+        peaks_detected_mask = (sig_change == -2) | (sig_change == -1) # 1->-1 or 0->-1
+        peaks_detected = df_window[peaks_detected_mask]
+        
+        if not peaks_detected.empty:
+             real_peak_vals = []
+             real_peak_dates = []
+             for idx, row in peaks_detected.iterrows():
+                 loc_idx = df_window.index.get_loc(idx)
+                 start_loc = max(0, loc_idx - 5)
+                 window_slice = df_window.iloc[start_loc:loc_idx+1]
+                 max_row = window_slice.loc[window_slice["high"].idxmax()]
+                 real_peak_vals.append(max_row["high"])
+                 real_peak_dates.append(max_row[date_col])
+
+             fig.add_trace(go.Scatter(
+                x=real_peak_dates, y=real_peak_vals,
+                mode='markers', name='🔎 Tespit Edilen Zirve',
+                marker=dict(color='red', symbol='circle-open', size=10,
+                           line=dict(width=2))
             ))
 
     # -------------------------------------------------------------

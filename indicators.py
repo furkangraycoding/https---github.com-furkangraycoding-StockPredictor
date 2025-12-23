@@ -56,11 +56,8 @@ class TechnicalAnalyzer:
                 elif price < last_pivot_price * (1 - threshold_pct):
                     # Reversal to downtrend -> Confirm previous PEAK
                     self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Tepe")] = last_pivot_price
-                    # Since we just confirmed a Peak, the state becomes "Last was Peak" (-1)
-                    # BUT strictly speaking, the state *changing* happens at 'i' (confirmation point).
-                    # However, for ML labels, we want to know what the LAST confirmed point was.
-                    # We will forward fill this later, or set it here.
-                    self.df.iloc[i:, self.df.columns.get_loc("Last_Signal")] = -1
+                    # Set Last_Signal to -1 (Peak) starting from the day AFTER the peak
+                    self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = -1
                     
                     trend = -1
                     last_pivot_price = price
@@ -73,16 +70,68 @@ class TechnicalAnalyzer:
                 elif price > last_pivot_price * (1 + threshold_pct):
                     # Reversal to uptrend -> Confirm previous DIP
                     self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Dip")] = last_pivot_price
-                    self.df.iloc[i:, self.df.columns.get_loc("Last_Signal")] = 1
+                    # Set Last_Signal to 1 (Dip) starting from the day AFTER the dip
+                    self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = 1
                     
                     trend = 1
                     last_pivot_price = price
                     last_pivot_idx = i
+
+        # NEW: Handle the LAST leg (Unconfirmed Potential Pivot)
+        # Use Dynamic Volatility Threshold (ATR) if available, otherwise Fixed %
+        # We use 2.0 * ATR as a standard reversal signal.
         
-        # Forward fill the initial state if not set (or use 0)
-        # The loop sets it from confirmation point 'i' onwards.
-        # So we really just need to handle the very beginning.
+        has_atk = "ATR" in self.df.columns and pd.notna(self.df["ATR"].iloc[-1])
         
+        if trend == 1: # Uptrend -> Looking for Peak rejection
+             diff = last_pivot_price - prices[-1]
+             pct_diff = diff / last_pivot_price
+             
+             # Default Thresholds (AGGRESSIVE SCALPING MODE)
+             atr_mult = 1.0 # 1x ATR is enough
+             pct_limit = 0.015 # Max wait 1.5% - Very tight leash
+             
+             # Fast Track with RSI (SUPER AGGRESSIVE)
+             if "RSI" in self.df.columns and self.df["RSI"].iloc[-1] < 60:
+                 atr_mult = 0.8 # Less than 1 Std Dev!
+                 pct_limit = 0.01 # 1% drop confirms peak if RSI agrees
+                 
+             if has_atk:
+                 atr = self.df["ATR"].iloc[-1]
+                 # Trigger if EITHER ATR threshold OR Max Percent threshold is met
+                 is_reversal = (diff > (atr_mult * atr)) or (pct_diff > pct_limit)
+             else:
+                 # Fallback fixed
+                 is_reversal = pct_diff > 0.01
+                 
+             if is_reversal:
+                 self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Tepe")] = last_pivot_price
+                 self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = -1
+                 
+        else: # Downtrend -> Looking for Dip bounce
+             diff = prices[-1] - last_pivot_price
+             pct_diff = diff / last_pivot_price
+             
+             # Default Thresholds (AGGRESSIVE)
+             atr_mult = 1.0
+             pct_limit = 0.015
+             
+             # Fast Track with RSI
+             if "RSI" in self.df.columns and self.df["RSI"].iloc[-1] > 40:
+                 atr_mult = 0.8
+                 pct_limit = 0.01
+                 
+             if has_atk:
+                 atr = self.df["ATR"].iloc[-1]
+                 is_reversal = (diff > (atr_mult * atr)) or (pct_diff > pct_limit)
+             else:
+                 # Fallback fixed
+                 is_reversal = pct_diff > 0.01
+            
+             if is_reversal:
+                 self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Dip")] = last_pivot_price
+                 self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = 1
+             
         return self.df
 
     def add_rolling_volatility(self, window: int = 20):
@@ -223,10 +272,68 @@ class TechnicalAnalyzer:
         try:
             time_diff = (dates - last_pivot_date).dt.days
             self.df["Days_Since_Last_Pivot"] = time_diff.fillna(0)
+            
+            # NEW: Cycle Phase (Dynamic Binning)
+            # Uptrend Avg = 31 days, Downtrend Avg = 19 days
+            # We want to categorize "Days Since" into 0 (Early), 1 (Mid), 2 (Late)
+            # depending on the CURRENT Trend.
+            
+            # Ensure Last_Signal is filled
+            last_sig = self.df["Last_Signal"].ffill().fillna(0)
+            
+            # Define Expected Duration based on state
+            # If Last_Signal == 1 (Dip happened, we are in Uptrend) -> Expect 31 days
+            # If Last_Signal == -1 (Peak happened, we are in Downtrend) -> Expect 19 days
+            expected_duration = np.where(last_sig == 1, 31.0, 19.0)
+            
+            progress = self.df["Days_Since_Last_Pivot"] / expected_duration
+            
+            # Binning: <0.4 -> 0, 0.4-0.8 -> 1, >0.8 -> 2
+            conditions = [
+                (progress < 0.4),
+                (progress >= 0.4) & (progress < 0.8),
+                (progress >= 0.8)
+            ]
+            choices = [0.0, 1.0, 2.0] # Float for ML friendly
+            
+            self.df["Cycle_Phase"] = np.select(conditions, choices, default=1.0)
+            
+            # Remove raw/continuous features to prevent overfitting
+            # self.df["Cycle_Progress"] = ... (Removed)
+            
         except Exception as e:
             # Fallback for integer index or error
             self.df["Days_Since_Last_Pivot"] = 0
+            self.df["Cycle_Progress"] = 0.0
             
+        return self.df
+
+    def add_advanced_stats(self):
+        """Calculates Volume-Price and Statistical features for high-precision detection."""
+        # 1. Money Flow Index (MFI) - RSI for Volume
+        # Typical Price = (High + Low + Close) / 3
+        tp = (self.df["high"] + self.df["low"] + self.df[self.price_col]) / 3
+        mf = tp * self.df["vol."]
+        
+        delta_tp = tp.diff()
+        pos_mf = mf.where(delta_tp > 0, 0).rolling(14).sum()
+        neg_mf = mf.where(delta_tp < 0, 0).rolling(14).sum()
+        
+        mfr = pos_mf / neg_mf
+        self.df["MFI_14"] = 100 - (100 / (1 + mfr))
+        
+        # 2. Volume Z-Score (Institutional Activity)
+        vol_mean = self.df["vol."].rolling(20).mean()
+        vol_std = self.df["vol."].rolling(20).std()
+        self.df["Vol_ZScore"] = (self.df["vol."] - vol_mean) / (vol_std + 1e-9)
+        
+        # 3. Kurtosis (Fat Tails / Reversal Prep)
+        self.df["Kurtosis_20"] = self.df[self.price_col].pct_change().rolling(20).kurt()
+        
+        # 4. Fractal signals (Higher/Lower extremes in window)
+        self.df["Fractal_High"] = self.df["high"].rolling(5, center=True).max() == self.df["high"]
+        self.df["Fractal_Low"] = self.df["low"].rolling(5, center=True).min() == self.df["low"]
+        
         return self.df
 
     def add_derived_features(self):
@@ -251,6 +358,9 @@ class TechnicalAnalyzer:
         # NEW: RSI & Time Features
         self.add_rsi_features()
         self.add_time_features()
+        
+        # NEW: Advanced Optimization Features
+        self.add_advanced_stats()
         
         return self.df
     

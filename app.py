@@ -61,40 +61,45 @@ with st.spinner("Calculating Technical Indicators..."):
     # Run analysis on the full history
     analyzer = TechnicalAnalyzer(df)
     
-    # Add Base Indicators
+    # Add Base Indicators (Safe to calculate globally)
     analyzer.add_moving_averages()
     analyzer.add_rsi()
     analyzer.add_atr()
-    
-    # Add Advanced Features
     analyzer.determine_regime()
-    # analyzer.add_local_extrema() # Old method
-    analyzer.add_zigzag_labels(threshold_pct=0.05) # New Quantitative Labeling
-    analyzer.add_rolling_volatility()
-    analyzer.add_drawdown_features()
-    df_full_enriched = analyzer.add_derived_features()
+    # Note: ZigZag and Derived Features (State) must be calculated dynamically 
+    # to avoid look-ahead bias in the simulation.
+    
+    df_with_basics = analyzer.get_df()
 
 # =====================================================
 # DATA SLICING (SIMULATE PAST)
 # =====================================================
 # For Training and "Current Status", we must pretend we are at 'selected_date'
-# We mask out the future observations.
-mask_past = df_full_enriched[DATE_COL] <= selected_date
-df_analyzed = df_full_enriched[mask_past].copy()
+mask_past = df_with_basics[DATE_COL] <= selected_date
+df_analyzed = df_with_basics[mask_past].copy()
 
 if df_analyzed.empty:
     st.error("Selected date is before the start of data. Please pick a later date.")
     st.stop()
 
+# DYNAMIC ENRICHMENT (No Leakage)
+# Re-run ZigZag and State logic only on the known history
+with st.spinner("Simulating Real-Time State..."):
+    sim_analyzer = TechnicalAnalyzer(df_analyzed)
+    sim_analyzer.add_zigzag_labels(threshold_pct=0.05)
+    sim_analyzer.add_rolling_volatility()
+    sim_analyzer.add_drawdown_features()
+    df_analyzed = sim_analyzer.add_derived_features()
+
 # =====================================================
 # MACHINE LEARNING ENGINE
 # =====================================================
-@st.cache_resource
-@st.cache_resource
+@st.cache_resource(hash_funcs={pd.DataFrame: lambda x: x.shape}) # Re-train if shape changes (new date)
 def get_trained_model(data):
     # Train on available history
     engine = MLEngine(data)
-    metrics, backtest_df = engine.train()
+    # Use True optimization for best results as requested, though it adds a delay
+    metrics, backtest_df = engine.train(optimize=True) 
     return engine, metrics, backtest_df
 
 with st.spinner("Training AI Prediction Models (Dips & Peaks)..."):
@@ -138,10 +143,10 @@ else:
 # Window: [selected_date - months_lookback] TO [selected_date + 30 days]
 window_start = selected_date - pd.DateOffset(months=months_lookback)
 
-# Base window from existing data
-df_window = df_full_enriched[
-    (df_full_enriched[DATE_COL] >= window_start) & 
-    (df_full_enriched[DATE_COL] <= selected_date)
+# Base window from existing data (Simulated History)
+df_window = df_analyzed[
+    (df_analyzed[DATE_COL] >= window_start) & 
+    (df_analyzed[DATE_COL] <= selected_date)
 ].copy()
 
 # FUTURE PROJECTION: If we are at the end or want to see what's next
@@ -207,12 +212,34 @@ st.subheader("📊 BIST100 + AI Predictions")
 render_plotly_chart(df_window, DATE_COL, selected_date=selected_date)
 
 # Current Status (Simple)
-if dip_prob > 0.50:
+# 1. Historical Fact Check (Did this actually turn out to be a Dip/Peak?)
+is_actual_dip = pd.notna(target_row.get("Dip"))
+is_actual_peak = pd.notna(target_row.get("Tepe"))
+
+if is_actual_dip:
+    st.info(f"✅ **Doğrulanmış Bilgi**: Bu tarih geçmişte **DİP** olarak teyit edilmiştir. (Model Tespiti: %{dip_prob*100:.0f})")
+elif is_actual_peak:
+    st.info(f"✅ **Doğrulanmış Bilgi**: Bu tarih geçmişte **TEPE** olarak teyit edilmiştir. (Model Tespiti: %{peak_prob*100:.0f})")
+
+# 2. AI Prediction (If not looking at a historical fact, or just to show confidence)
+elif dip_prob > 0.50:
     st.success(f"🟢 **AI BUY Signal Today**: Dip Probability = %{dip_prob*100:.0f}")
 elif peak_prob > 0.50:
     st.error(f"🔴 **AI SELL Signal Today**: Peak Probability = %{peak_prob*100:.0f}")
 else:
-    st.info(f"⚪ **No Strong Signal**: Dip=%{dip_prob*100:.0f}, Peak=%{peak_prob*100:.0f}")
+    # Smart "Trend Continuation" Logic
+    last_sig = target_row.get("Last_Signal", 0)
+    
+    # If we are in an Uptrend (Last=Dip) and Peak probability is very low, it means "Hold / Continue"
+    if last_sig == 1 and peak_prob < 0.20:
+         st.success(f"📈 **Yükseliş Trendi Devam Ediyor**: Tepe (Satış) Sinyali Yok. (Peak Prob: %{peak_prob*100:.0f})")
+         
+    # If we are in a Downtrend (Last=Peak) and Dip probability is very low, it means "Wait / Continue"
+    elif last_sig == -1 and dip_prob < 0.20:
+         st.error(f"📉 **Düşüş Trendi Devam Ediyor**: Dip (Alış) Sinyali Yok. (Dip Prob: %{dip_prob*100:.0f})")
+         
+    else:
+        st.info(f"⚪ **Güçlü Sinyal Yok**: Dip=%{dip_prob*100:.0f}, Peak=%{peak_prob*100:.0f}")
 
 # =====================================================
 # FUTURE PREDICTIONS LIST

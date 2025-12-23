@@ -52,10 +52,17 @@ class MLEngine:
             "Drawdown_Pct",
             "Rally_Pct",
             
-            # RSI Delta & Time Decay (NEW)
+            # NEW: RSI Delta & Time Decay
+            # NEW: RSI Delta & Time Decay
             "RSI_Diff_1D",
-            "RSI_Diff_3D",
-            "Days_Since_Last_Pivot"
+            "Cycle_Phase", # Dynamic Binned Time (0, 1, 2)
+            
+            # NEW: Advanced Optimization Features
+            "MFI_14",
+            "Vol_ZScore",
+            "Kurtosis_20",
+            "Fractal_High",
+            "Fractal_Low"
         ]
 
     def prepare_data(self):
@@ -78,8 +85,17 @@ class MLEngine:
         
         # Rename ZigZag columns to Labels if needed or create binary targets
         # ZigZag creates 'Tepe' (Peak Price) and 'Dip' (Dip Price) columns where event occurs
-        self.df["Label_Dip"] = np.where(self.df["Dip"].notna(), 1, 0)
-        self.df["Label_Peak"] = np.where(self.df["Tepe"].notna(), 1, 0)
+        # LABEL EXPANSION (Smearing):
+        # Predicting the exact single day of a pivot is extremely hard.
+        # We expand the target to include +/- 2 days around the pivot.
+        # This teaches the model to identify the "Turning Phase" not just a single point.
+        
+        raw_dip = np.where(self.df["Dip"].notna(), 1, 0)
+        raw_peak = np.where(self.df["Tepe"].notna(), 1, 0)
+        
+        # Window=5 with center=True covers: [t-2, t-1, t, t+1, t+2]
+        self.df["Label_Dip"] = pd.Series(raw_dip).rolling(window=5, min_periods=1, center=True).max().fillna(0).astype(int)
+        self.df["Label_Peak"] = pd.Series(raw_peak).rolling(window=5, min_periods=1, center=True).max().fillna(0).astype(int)
         
         # Normalize/Fill Features
         for col in self.features:
@@ -98,10 +114,11 @@ class MLEngine:
         st.write(f"⚙️ Tuning Hyperparameters for {task_name} Model...")
         
         param_dist = {
-            "n_estimators": [100, 200, 300, 500],
-            "max_depth": [5, 8, 10, 15, None],
-            "min_samples_leaf": [2, 4, 8, 10],
-            "min_samples_split": [2, 5, 10],
+            "n_estimators": [100, 200, 300, 400, 500, 700],
+            "max_depth": [5, 8, 10, 12, 15, 20, None],
+            "min_samples_leaf": [1, 2, 4, 6, 8, 10],
+            "min_samples_split": [2, 5, 10, 15],
+            "max_features": ["sqrt", "log2", None],
             "class_weight": ["balanced", "balanced_subsample"]
         }
         
@@ -113,7 +130,7 @@ class MLEngine:
         search = RandomizedSearchCV(
             estimator=rf,
             param_distributions=param_dist,
-            n_iter=10, # Keep it efficient for now
+            n_iter=20, # Higher for deeper search
             scoring=scorer,
             cv=tscv,
             verbose=0,
@@ -130,6 +147,15 @@ class MLEngine:
         Trains directly on State-Filtered Data.
         """
         data = self.prepare_data()
+        
+        # FEATURE DROPOUT (Regularization)
+        # Randomly mask 'Cycle_Phase' in 30% of training data to force reliance on Technicals.
+        if "Cycle_Phase" in data.columns:
+             # Using a fixed seed for reproducibility of the dropout mask if needed, but random is fine for robustness
+             # Set to -1 (which the tree will treat as a separate category or 'unknown')
+             # This teaches the model: "Sometimes you don't know the time, so look at RSI!"
+             mask = np.random.rand(len(data)) < 0.30
+             data.loc[mask, "Cycle_Phase"] = -1
         
         if data.empty:
             return {}, pd.DataFrame()
