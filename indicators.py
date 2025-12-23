@@ -12,11 +12,12 @@ class TechnicalAnalyzer:
         self.df = df.copy()
         self.price_col = price_col
 
-    def add_zigzag_labels(self, threshold_pct: float = 0.05):
+    def add_zigzag_labels(self, threshold_pct: float = 0.03, atr_factor: float = 2.5):
         """
         Identifies turning points using the ZigZag algorithm.
         Also adds 'Last_Signal' state: 1 (Dip confirmed, looking for Peak), -1 (Peak confirmed, looking for Dip).
-        threshold_pct: Minimum percentage movement to change trend (0.05 = 5%).
+        threshold_pct: Minimum percentage movement to change trend (0.03 = 3%).
+        atr_factor: Factor of ATR to use as a dynamic threshold (e.g., 2.5 * ATR).
         """
         if self.price_col not in self.df.columns:
             return self.df
@@ -25,6 +26,10 @@ class TechnicalAnalyzer:
         n = len(prices)
         if n < 2:
             return self.df
+            
+        # Ensure ATR exists for dynamic thresholding
+        has_atr = "ATR" in self.df.columns
+        atrs = self.df["ATR"].values if has_atr else np.zeros(n)
             
         # 1 = Up (Last was Dip), -1 = Down (Last was Peak)
         trend = 0 
@@ -47,35 +52,61 @@ class TechnicalAnalyzer:
         # ZigZag Loop
         for i in range(1, n):
             price = prices[i]
+            current_atr = atrs[i] if has_atr and not np.isnan(atrs[i]) else 0
+            
+            # Dynamic Reversal Threshold:
+            # We trigger reversal if price moves > threshold_pct OR > atr_factor * ATR
+            # This allows catching high-volatility moves faster than the % threshold.
             
             if trend == 1: # Uptrend (Last confirmed was Dip)
                 if price > last_pivot_price:
                     # New high in existing uptrend
                     last_pivot_price = price
                     last_pivot_idx = i
-                elif price < last_pivot_price * (1 - threshold_pct):
-                    # Reversal to downtrend -> Confirm previous PEAK
-                    self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Tepe")] = last_pivot_price
-                    # Set Last_Signal to -1 (Peak) starting from the day AFTER the peak
-                    self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = -1
+                else:
+                    # Check Reversal Criteria
+                    # Top -> Down
+                    pct_move = (last_pivot_price - price) / last_pivot_price
+                    atr_move = (last_pivot_price - price)
                     
-                    trend = -1
-                    last_pivot_price = price
-                    last_pivot_idx = i
+                    is_reversal = (pct_move > threshold_pct)
+                    if current_atr > 0:
+                        is_reversal = is_reversal or (atr_move > atr_factor * current_atr)
+                    
+                    if is_reversal:
+                        # Reversal to downtrend -> Confirm previous PEAK
+                        self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Tepe")] = last_pivot_price
+                        # Set Last_Signal to -1 (Peak) starting from the day AFTER the peak
+                        self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = -1
+                        
+                        trend = -1
+                        last_pivot_price = price
+                        last_pivot_idx = i
+                        
             else: # Downtrend (Last confirmed was Peak)
                 if price < last_pivot_price:
                     # New low in existing downtrend
                     last_pivot_price = price
                     last_pivot_idx = i
-                elif price > last_pivot_price * (1 + threshold_pct):
-                    # Reversal to uptrend -> Confirm previous DIP
-                    self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Dip")] = last_pivot_price
-                    # Set Last_Signal to 1 (Dip) starting from the day AFTER the dip
-                    self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = 1
+                else:
+                    # Check Reversal Criteria
+                    # Bottom -> Up
+                    pct_move = (price - last_pivot_price) / last_pivot_price
+                    atr_move = (price - last_pivot_price)
                     
-                    trend = 1
-                    last_pivot_price = price
-                    last_pivot_idx = i
+                    is_reversal = (pct_move > threshold_pct)
+                    if current_atr > 0:
+                        is_reversal = is_reversal or (atr_move > atr_factor * current_atr)
+                        
+                    if is_reversal:
+                        # Reversal to uptrend -> Confirm previous DIP
+                        self.df.iloc[last_pivot_idx, self.df.columns.get_loc("Dip")] = last_pivot_price
+                        # Set Last_Signal to 1 (Dip) starting from the day AFTER the dip
+                        self.df.iloc[last_pivot_idx + 1:, self.df.columns.get_loc("Last_Signal")] = 1
+                        
+                        trend = 1
+                        last_pivot_price = price
+                        last_pivot_idx = i
 
         # NEW: Handle the LAST leg (Unconfirmed Potential Pivot)
         # Use Dynamic Volatility Threshold (ATR) if available, otherwise Fixed %

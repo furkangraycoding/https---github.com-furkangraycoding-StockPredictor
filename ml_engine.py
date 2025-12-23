@@ -70,7 +70,8 @@ class MLEngine:
         # Ensure labels are generated using consistent ZigZag logic
         # We re-run it here to be safe and independent
         analyzer = TechnicalAnalyzer(self.df)
-        analyzer.add_zigzag_labels(threshold_pct=0.05)
+        analyzer = TechnicalAnalyzer(self.df)
+        analyzer.add_zigzag_labels(threshold_pct=0.03, atr_factor=2.5)
         self.df = analyzer.get_df()
         
         # Forward fill the 'Last_Signal' state
