@@ -149,9 +149,9 @@ df_window = df_analyzed[
     (df_analyzed[DATE_COL] <= selected_date)
 ].copy()
 
-# ENRICH HISTORY WITH AI PREDICTIONS
-# We need this to check "Persistence" (Last 5 days signals)
-df_window = ml_engine.add_predictions_to_df(df_window)
+# ENRICH HISTORY WITH AI PREDICTIONS (with Forward Confirmation)
+# Forward confirmation: Önceki 4 gün + seçilen gün + sonraki 1-3 gün analizi
+df_window = ml_engine.add_predictions_to_df(df_window, use_forward_confirmation=True)
 
 # FUTURE PROJECTION: If we are at the end or want to see what's next
 with st.spinner("Generating AI Future Forecast..."):
@@ -171,8 +171,8 @@ with st.spinner("Generating AI Future Forecast..."):
         forecast_analyzer.determine_regime()
         df_combined = forecast_analyzer.add_derived_features()
         
-        # 4. Run AI Predictions on the projected portion
-        df_combined = ml_engine.add_predictions_to_df(df_combined)
+        # 4. Run AI Predictions on the projected portion (with Forward Confirmation)
+        df_combined = ml_engine.add_predictions_to_df(df_combined, use_forward_confirmation=True)
         
         # 5. Extract only the forecast portion
         df_forecast_enriched = df_combined[df_combined["is_forecast"] == True].copy()

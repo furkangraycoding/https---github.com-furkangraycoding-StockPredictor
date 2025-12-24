@@ -39,7 +39,16 @@ class MLEngine:
             "MACD_Hist", "DI_Diff", "ADX_14", "Drawdown_Pct", "Rally_Pct", 
             "RSI_Diff_1D", "Cycle_Phase", "MFI_14", "Vol_ZScore", 
             "Kurtosis_20", "Fractal_High", "Fractal_Low", "RSI_Price_Corr_14",
-            "RSI_Overbought_Days", "Leg_Return"
+            "RSI_Overbought_Days", "Leg_Return",
+            # NEW: Cycle & Exhaustion Features
+            "Cycle_Length", "Cycle_Length_Ratio", "Avg_Cycle_Length",
+            "Price_Exhaustion_5D", "Price_Exhaustion_10D", "Price_Exhaustion_20D",
+            "Price_Exhaustion_5D_ATR", "Price_Range_10D",
+            "RSI_Decay_1D", "RSI_Decay_3D", "RSI_Decay_5D", "RSI_Decay_Accel",
+            "ATR_Expansion_5D", "ATR_Expansion_10D", "ATR_vs_Avg",
+            "Trend_Exhaustion_Score", "Dip_Exhaustion_Score",
+            "Price_Blowoff", "Volume_Blowoff",
+            "RSI_Oversold_Days"  # Added oversold duration
         ]
         
         # DIP MODEL: Can use everything (It works well)
@@ -71,7 +80,13 @@ class MLEngine:
             "Fractal_High", 
             "Fractal_Low",
             "RSI_Price_Corr_14", # Divergence
-            "RSI_Overbought_Days" # Time Decay
+            "RSI_Overbought_Days", # Time Decay
+            # NEW: Exhaustion features for peak detection
+            "Cycle_Length_Ratio",  # Cycle length relative to average
+            "RSI_Decay_1D", "RSI_Decay_3D", "RSI_Decay_5D",  # Momentum decay
+            "ATR_Expansion_5D", "ATR_vs_Avg",  # Volatility expansion
+            "Trend_Exhaustion_Score",  # Composite exhaustion
+            "Price_Blowoff", "Volume_Blowoff"  # Extreme moves
         ]
 
     def prepare_data(self):
@@ -135,19 +150,20 @@ class MLEngine:
         
         return self.df
 
-    def tune_hyperparameters(self, X, y, task_name="Task"):
+    def tune_hyperparameters(self, X, y, task_name="Task", feature_names=None):
         """
         Optimizes Random Forest hyperparameters using RandomizedSearchCV.
+        Returns tuned model and feature importance-based feature selection.
         """
         st.write(f"⚙️ Tuning Hyperparameters for {task_name} Model...")
         
         param_dist = {
-            "n_estimators": [100, 200, 300, 400, 500, 700],
-            "max_depth": [5, 8, 10, 12, 15, 20, None],
-            "min_samples_leaf": [1, 2, 4, 6, 8, 10],
-            "min_samples_split": [2, 5, 10, 15],
-            "max_features": ["sqrt", "log2", None],
-            "class_weight": ["balanced", "balanced_subsample"]
+            "n_estimators": [200, 300, 400, 500, 700, 1000],
+            "max_depth": [8, 10, 12, 15, 20, 25, None],
+            "min_samples_leaf": [1, 2, 4, 6, 8],
+            "min_samples_split": [2, 5, 10, 15, 20],
+            "max_features": ["sqrt", "log2", 0.5, 0.7, None],
+            "class_weight": ["balanced", "balanced_subsample", None]
         }
         
         tscv = TimeSeriesSplit(n_splits=3)
@@ -158,7 +174,7 @@ class MLEngine:
         search = RandomizedSearchCV(
             estimator=rf,
             param_distributions=param_dist,
-            n_iter=20, # Higher for deeper search
+            n_iter=30, # Increased for better search
             scoring=scorer,
             cv=tscv,
             verbose=0,
@@ -167,8 +183,30 @@ class MLEngine:
         )
         
         search.fit(X, y)
+        best_model = search.best_estimator_
         st.write(f"✅ Best Params for {task_name}: {search.best_params_}")
-        return search.best_estimator_
+        
+        # Get feature importances from tuned model
+        if feature_names is not None and hasattr(best_model, 'feature_importances_'):
+            importances = pd.Series(best_model.feature_importances_, index=feature_names)
+            # Filter features with importance >= 0.05
+            selected_features = importances[importances >= 0.05].index.tolist()
+            
+            # If too many features dropped, keep at least top 10
+            if len(selected_features) < 10:
+                selected_features = importances.sort_values(ascending=False).head(10).index.tolist()
+                st.write(f"⚠️ Only {len(selected_features)} features with importance >= 0.05, keeping top 10")
+            
+            st.write(f"📊 Feature Selection: {len(selected_features)}/{len(feature_names)} features kept (importance >= 0.05)")
+            
+            # Show dropped features
+            dropped = [f for f in feature_names if f not in selected_features]
+            if dropped:
+                st.write(f"🗑️ Dropped features ({len(dropped)}): {', '.join(dropped[:10])}{'...' if len(dropped) > 10 else ''}")
+            
+            return best_model, selected_features, importances
+        else:
+            return best_model, None, None
 
     def train(self, optimize=True):
         """
@@ -199,22 +237,42 @@ class MLEngine:
         y_dip = train_data.loc[dip_mask, "Label_Dip"]
         
         if not X_dip.empty and y_dip.sum() > 0:
-            # First Pass: Feature Importance Selection
-            base_dip = RandomForestClassifier(n_estimators=100, random_state=42)
-            base_dip.fit(X_dip, y_dip)
-            imps = pd.Series(base_dip.feature_importances_, index=self.dip_features)
-            self.dip_features = imps[imps >= 0.05].index.tolist()
-            
-            # If all features dropped (rare), keep top 3
-            if not self.dip_features:
-                 self.dip_features = imps.sort_values(ascending=False).head(3).index.tolist()
-            
-            # Second Pass: Final model with selected features
-            X_dip_selected = X_dip[self.dip_features]
+            # Step 1: Hyperparameter Tuning with ALL features
             if optimize:
-                self.dip_model = self.tune_hyperparameters(X_dip_selected, y_dip, "Dip")
-            
-            self.dip_model.fit(X_dip_selected, y_dip)
+                tuned_model, selected_features, importances = self.tune_hyperparameters(
+                    X_dip, y_dip, "Dip", feature_names=self.dip_features
+                )
+                
+                if selected_features is not None:
+                    # Update feature list based on tuned model importance
+                    self.dip_features = selected_features
+                    X_dip_selected = X_dip[self.dip_features]
+                    self.dip_model = tuned_model
+                    
+                    # Re-fit with selected features only
+                    self.dip_model.fit(X_dip_selected, y_dip)
+                    
+                    # Log feature importance summary
+                    if importances is not None:
+                        top_features = importances.sort_values(ascending=False).head(10)
+                        st.write(f"🔝 Top 10 Dip Features: {', '.join(top_features.index.tolist())}")
+                else:
+                    # Fallback: use tuned model as is
+                    self.dip_model = tuned_model
+                    self.dip_model.fit(X_dip, y_dip)
+            else:
+                # No optimization: Quick feature selection with base model
+                base_dip = RandomForestClassifier(n_estimators=100, random_state=42)
+                base_dip.fit(X_dip, y_dip)
+                imps = pd.Series(base_dip.feature_importances_, index=self.dip_features)
+                self.dip_features = imps[imps >= 0.05].index.tolist()
+                
+                if not self.dip_features:
+                    self.dip_features = imps.sort_values(ascending=False).head(10).index.tolist()
+                
+                X_dip_selected = X_dip[self.dip_features]
+                self.dip_model = RandomForestClassifier(**self.rf_params)
+                self.dip_model.fit(X_dip_selected, y_dip)
             
             # Evaluate on Test Set (Blind) using SELECTED features
             test_dip_mask = (test_data["Last_Signal"] == -1) | (test_data["Last_Signal"] == 0)
@@ -235,36 +293,50 @@ class MLEngine:
         y_peak = train_data.loc[peak_mask, "Label_Peak"]
 
         if not X_peak.empty and y_peak.sum() > 0:
-            # First Pass: Feature Importance Selection
-            base_peak = RandomForestClassifier(n_estimators=100, random_state=42)
-            base_peak.fit(X_peak, y_peak)
-            imps = pd.Series(base_peak.feature_importances_, index=self.peak_features)
-            self.peak_features = imps[imps >= 0.05].index.tolist()
-            
-            # If all features dropped, keep top 3
-            if not self.peak_features:
-                 self.peak_features = imps.sort_values(ascending=False).head(3).index.tolist()
-
-            # Prepare Training Set with SELECTED features
-            X_peak_selected = X_peak[self.peak_features]
+            # Prepare oversampled data for peak model (before feature selection)
             pos_mask = (y_peak == 1)
-            X_peak_pos = X_peak_selected[pos_mask]
+            X_peak_pos = X_peak[pos_mask]
             y_peak_pos = y_peak[pos_mask]
             
-            X_peak_oversampled = pd.concat([X_peak_selected] + [X_peak_pos]*10)
+            X_peak_oversampled = pd.concat([X_peak] + [X_peak_pos]*10)
             y_peak_oversampled = pd.concat([y_peak] + [y_peak_pos]*10)
             
+            # Step 1: Hyperparameter Tuning with ALL features
             if optimize:
-                self.peak_model = self.tune_hyperparameters(X_peak_oversampled, y_peak_oversampled, "Peak")
-            else:
-                self.peak_model = RandomForestClassifier(
-                    n_estimators=300, 
-                    max_depth=15, 
-                    min_samples_leaf=1, 
-                    random_state=42
+                tuned_model, selected_features, importances = self.tune_hyperparameters(
+                    X_peak_oversampled, y_peak_oversampled, "Peak", feature_names=self.peak_features
                 )
                 
-            self.peak_model.fit(X_peak_oversampled, y_peak_oversampled)
+                if selected_features is not None:
+                    # Update feature list based on tuned model importance
+                    self.peak_features = selected_features
+                    X_peak_selected = X_peak_oversampled[self.peak_features]
+                    self.peak_model = tuned_model
+                    
+                    # Re-fit with selected features only
+                    self.peak_model.fit(X_peak_selected, y_peak_oversampled)
+                    
+                    # Log feature importance summary
+                    if importances is not None:
+                        top_features = importances.sort_values(ascending=False).head(10)
+                        st.write(f"🔝 Top 10 Peak Features: {', '.join(top_features.index.tolist())}")
+                else:
+                    # Fallback: use tuned model as is
+                    self.peak_model = tuned_model
+                    self.peak_model.fit(X_peak_oversampled, y_peak_oversampled)
+            else:
+                # No optimization: Quick feature selection with base model
+                base_peak = RandomForestClassifier(n_estimators=100, random_state=42)
+                base_peak.fit(X_peak_oversampled, y_peak_oversampled)
+                imps = pd.Series(base_peak.feature_importances_, index=self.peak_features)
+                self.peak_features = imps[imps >= 0.05].index.tolist()
+                
+                if not self.peak_features:
+                    self.peak_features = imps.sort_values(ascending=False).head(10).index.tolist()
+                
+                X_peak_selected = X_peak_oversampled[self.peak_features]
+                self.peak_model = RandomForestClassifier(**self.rf_params)
+                self.peak_model.fit(X_peak_selected, y_peak_oversampled)
             
             # Evaluate on Test Set (Blind)
             test_peak_mask = (test_data["Last_Signal"] == 1) | (test_data["Last_Signal"] == 0)
@@ -336,9 +408,15 @@ class MLEngine:
         except Exception as e:
             return 0.0, 0.0
 
-    def add_predictions_to_df(self, df: pd.DataFrame, threshold: float = 0.50):
+    def add_predictions_to_df(self, df: pd.DataFrame, threshold: float = 0.50, use_forward_confirmation: bool = True):
         """
-        Runs inference with State Filtering.
+        Runs inference with State Filtering and Forward Confirmation.
+        
+        Forward Confirmation Logic:
+        - Önceki 4 gün + seçilen gün + sonraki 1-3 gün analiz edilir
+        - Sonraki günlerde trend kırılımı varsa, seçilen gün saf sinyal olarak işaretlenir
+        - Peak: Sonraki günlerde dip_prob artıyor veya fiyat düşüyor → Peak doğrulandı
+        - Dip: Sonraki günlerde peak_prob artıyor veya fiyat yükseliyor → Dip doğrulandı
         """
         scan_df = df.copy()
         
@@ -358,16 +436,26 @@ class MLEngine:
             peak_probs = self.peak_model.predict_proba(scan_df[self.peak_features])[:, 1]
             rsi_vals = scan_df["rsi_14"] if "rsi_14" in scan_df.columns else (scan_df["RSI"] if "RSI" in scan_df.columns else 50)
             
-            # 2. Purity Logic for binary signals (Strict Mode)
-            # Peak: Prob >= 0.85 and (Peak% - Dip%) > RSI * 0.48
+            # 2. Base Purity Logic (Initial Check)
             peak_gap = (peak_probs - dip_probs) * 100
             peak_threshold = rsi_vals * 0.48
-            is_pure_peak = (peak_probs >= 0.85) & (peak_gap > peak_threshold)
+            base_pure_peak = (peak_probs >= 0.85) & (peak_gap > peak_threshold)
             
-            # Dip: Hybrid Logic (85%|1.1x OR 72%|1.3x)
             dip_gap = (dip_probs - peak_probs) * 100
-            is_pure_dip = ((dip_probs >= 0.85) & (dip_gap > rsi_vals * 1.1)) | \
-                          ((dip_probs >= 0.72) & (dip_gap > rsi_vals * 1.3))
+            base_pure_dip = ((dip_probs >= 0.85) & (dip_gap > rsi_vals * 1.1)) | \
+                           ((dip_probs >= 0.72) & (dip_gap > rsi_vals * 1.3))
+            
+            # 3. Forward Confirmation Logic (if enabled)
+            if use_forward_confirmation:
+                is_pure_peak = self._apply_forward_confirmation_peak(
+                    scan_df, base_pure_peak, peak_probs, dip_probs, rsi_vals
+                )
+                is_pure_dip = self._apply_forward_confirmation_dip(
+                    scan_df, base_pure_dip, peak_probs, dip_probs, rsi_vals
+                )
+            else:
+                is_pure_peak = base_pure_peak
+                is_pure_dip = base_pure_dip
 
             df["AI_Dip"] = is_pure_dip.astype(int)
             df["AI_Peak"] = is_pure_peak.astype(int)
@@ -382,6 +470,185 @@ class MLEngine:
             df["AI_Peak_Prob"] = 0.0
             
         return df
+    
+    def _apply_forward_confirmation_peak(self, df, base_signals, peak_probs, dip_probs, rsi_vals):
+        """
+        Forward confirmation for Peak signals.
+        Peak için: Sonraki 1-3 günde dip_prob artıyor veya fiyat düşüyor → Peak doğrulandı
+        
+        Mantık:
+        1. Base signal varsa ve forward confirmation varsa → KESIN SAF SİNYAL
+        2. Base signal yoksa ama forward confirmation güçlüyse → YENİDEN DEĞERLENDİR
+        3. Önceki 4 günde persistence varsa → EK DOĞRULAMA
+        """
+        confirmed_signals = base_signals.copy()
+        n = len(df)
+        
+        # Convert to numpy arrays for easier indexing
+        base_signals_arr = base_signals.values if hasattr(base_signals, 'values') else base_signals
+        peak_probs_arr = peak_probs.values if hasattr(peak_probs, 'values') else peak_probs
+        dip_probs_arr = dip_probs.values if hasattr(dip_probs, 'values') else dip_probs
+        rsi_vals_arr = rsi_vals.values if hasattr(rsi_vals, 'values') else rsi_vals
+        
+        for i in range(n):
+            # Base signal kontrolü (opsiyonel - forward confirmation base signal olmadan da çalışabilir)
+            has_base_signal = base_signals_arr[i] if i < len(base_signals_arr) else False
+            
+            current_peak_prob = peak_probs_arr[i]
+            current_dip_prob = dip_probs_arr[i]
+            current_rsi = rsi_vals_arr[i]
+            
+            # Sonraki 1-3 günü kontrol et
+            forward_confirmed = False
+            
+            for lookahead in [1, 2, 3]:
+                if i + lookahead >= n:
+                    break
+                
+                future_peak_prob = peak_probs_arr[i + lookahead]
+                future_dip_prob = dip_probs_arr[i + lookahead]
+                
+                # Trend kırılımı kontrolü:
+                # 1. Dip prob artıyor (trend dönüşü)
+                dip_prob_increase = future_dip_prob > current_dip_prob + 0.10  # %10+ artış
+                
+                # 2. Peak prob düşüyor (momentum kaybı)
+                peak_prob_decrease = future_peak_prob < current_peak_prob - 0.05  # %5+ düşüş
+                
+                # 3. Fiyat düşüyor (gerçek kırılım)
+                price_decrease = False
+                if "price" in df.columns:
+                    current_price = df.iloc[i]["price"]
+                    future_price = df.iloc[i + lookahead]["price"]
+                    price_decrease = future_price < current_price * 0.98  # %2+ düşüş
+                
+                # 4. Gap değişimi (dip prob peak prob'u geçiyor)
+                current_gap = (current_peak_prob - current_dip_prob) * 100
+                future_gap = (future_peak_prob - future_dip_prob) * 100
+                gap_reversal = future_gap < current_gap - 10  # Gap 10+ puan azalıyor
+                
+                # Forward confirmation: En az 2 kriter sağlanmalı
+                confirmation_score = sum([
+                    dip_prob_increase,
+                    peak_prob_decrease,
+                    price_decrease,
+                    gap_reversal
+                ])
+                
+                if confirmation_score >= 2:
+                    forward_confirmed = True
+                    break
+            
+            # Önceki 4 günün persistence kontrolü (opsiyonel, daha güvenilir sinyal için)
+            persistence_score = 0
+            if i >= 4:
+                for lookback in [1, 2, 3, 4]:
+                    past_peak_prob = peak_probs_arr[i - lookback]
+                    if past_peak_prob >= 0.70:  # Önceki günlerde de yüksek peak prob
+                        persistence_score += 1
+            
+            # Final decision: Base signal + Forward confirmation + (opsiyonel) Persistence
+            # 1. Forward confirmation varsa → KESIN SAF SİNYAL (base signal olsun ya da olmasın)
+            if forward_confirmed:
+                confirmed_signals.iloc[i] = True
+            # 2. Base signal var + Persistence var → GÜVENİLİR SİNYAL
+            elif has_base_signal and persistence_score >= 2:
+                confirmed_signals.iloc[i] = True
+            # 3. Base signal var ama forward confirmation yok → BASE SİNYAL (eski mantık)
+            elif has_base_signal:
+                confirmed_signals.iloc[i] = True
+            # 4. Hiçbiri yok → SİNYAL YOK
+            else:
+                confirmed_signals.iloc[i] = False
+        
+        return confirmed_signals
+    
+    def _apply_forward_confirmation_dip(self, df, base_signals, peak_probs, dip_probs, rsi_vals):
+        """
+        Forward confirmation for Dip signals.
+        Dip için: Sonraki 1-3 günde peak_prob artıyor veya fiyat yükseliyor → Dip doğrulandı
+        """
+        confirmed_signals = base_signals.copy()
+        n = len(df)
+        
+        # Convert to numpy arrays for easier indexing
+        base_signals_arr = base_signals.values if hasattr(base_signals, 'values') else base_signals
+        peak_probs_arr = peak_probs.values if hasattr(peak_probs, 'values') else peak_probs
+        dip_probs_arr = dip_probs.values if hasattr(dip_probs, 'values') else dip_probs
+        rsi_vals_arr = rsi_vals.values if hasattr(rsi_vals, 'values') else rsi_vals
+        
+        for i in range(n):
+            # Base signal kontrolü (opsiyonel)
+            has_base_signal = base_signals_arr[i] if i < len(base_signals_arr) else False
+            
+            current_dip_prob = dip_probs_arr[i]
+            current_peak_prob = peak_probs_arr[i]
+            current_rsi = rsi_vals_arr[i]
+            
+            # Sonraki 1-3 günü kontrol et
+            forward_confirmed = False
+            
+            for lookahead in [1, 2, 3]:
+                if i + lookahead >= n:
+                    break
+                
+                future_dip_prob = dip_probs_arr[i + lookahead]
+                future_peak_prob = peak_probs_arr[i + lookahead]
+                
+                # Trend kırılımı kontrolü:
+                # 1. Peak prob artıyor (trend dönüşü)
+                peak_prob_increase = future_peak_prob > current_peak_prob + 0.10  # %10+ artış
+                
+                # 2. Dip prob düşüyor (momentum kaybı)
+                dip_prob_decrease = future_dip_prob < current_dip_prob - 0.05  # %5+ düşüş
+                
+                # 3. Fiyat yükseliyor (gerçek kırılım)
+                price_increase = False
+                if "price" in df.columns:
+                    current_price = df.iloc[i]["price"]
+                    future_price = df.iloc[i + lookahead]["price"]
+                    price_increase = future_price > current_price * 1.02  # %2+ yükseliş
+                
+                # 4. Gap değişimi (peak prob dip prob'u geçiyor)
+                current_gap = (current_dip_prob - current_peak_prob) * 100
+                future_gap = (future_dip_prob - future_peak_prob) * 100
+                gap_reversal = future_gap < current_gap - 10  # Gap 10+ puan azalıyor (dip avantajı kayboluyor)
+                
+                # Forward confirmation: En az 2 kriter sağlanmalı
+                confirmation_score = sum([
+                    peak_prob_increase,
+                    dip_prob_decrease,
+                    price_increase,
+                    gap_reversal
+                ])
+                
+                if confirmation_score >= 2:
+                    forward_confirmed = True
+                    break
+            
+            # Önceki 4 günün persistence kontrolü
+            persistence_score = 0
+            if i >= 4:
+                for lookback in [1, 2, 3, 4]:
+                    past_dip_prob = dip_probs_arr[i - lookback]
+                    if past_dip_prob >= 0.60:  # Önceki günlerde de yüksek dip prob
+                        persistence_score += 1
+            
+            # Final decision
+            # 1. Forward confirmation varsa → KESIN SAF SİNYAL
+            if forward_confirmed:
+                confirmed_signals.iloc[i] = True
+            # 2. Base signal var + Persistence var → GÜVENİLİR SİNYAL
+            elif has_base_signal and persistence_score >= 2:
+                confirmed_signals.iloc[i] = True
+            # 3. Base signal var ama forward confirmation yok → BASE SİNYAL
+            elif has_base_signal:
+                confirmed_signals.iloc[i] = True
+            # 4. Hiçbiri yok → SİNYAL YOK
+            else:
+                confirmed_signals.iloc[i] = False
+        
+        return confirmed_signals
 
     def forecast_future(self, df: pd.DataFrame, days: int = 30):
         """

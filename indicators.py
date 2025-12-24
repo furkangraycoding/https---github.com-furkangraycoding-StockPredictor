@@ -270,7 +270,7 @@ class TechnicalAnalyzer:
         return self.df
     
     def add_rsi_features(self):
-        """Calculates RSI changes and Overbought Duration."""
+        """Calculates RSI changes and Overbought/Oversold Duration."""
         if "RSI" not in self.df.columns: self.add_rsi()
         
         self.df["RSI_Diff_1D"] = self.df["RSI"].diff(1)
@@ -281,6 +281,11 @@ class TechnicalAnalyzer:
         is_ob = (self.df["RSI"] > 70).astype(int)
         grouper = (is_ob != is_ob.shift()).cumsum()
         self.df["RSI_Overbought_Days"] = is_ob.groupby(grouper).cumsum()
+        
+        # Calculate consecutive days in Oversold zone (<30)
+        is_os = (self.df["RSI"] < 30).astype(int)
+        grouper_os = (is_os != is_os.shift()).cumsum()
+        self.df["RSI_Oversold_Days"] = is_os.groupby(grouper_os).cumsum()
         
         return self.df
 
@@ -426,6 +431,9 @@ class TechnicalAnalyzer:
         # NEW: Advanced Optimization Features
         self.add_advanced_stats()
         
+        # NEW: Cycle & Exhaustion Features
+        self.add_cycle_exhaustion_features()
+        
         return self.df
     
     def add_bollinger_bands(self, period: int = 20, std: int = 2):
@@ -470,6 +478,198 @@ class TechnicalAnalyzer:
         self.df["Lower_Shadow_Ratio"] = lower_shadow / total_range
         self.df["Upper_Shadow_Ratio"] = upper_shadow / total_range
         self.df["Body_Ratio"] = body_size / total_range
+        
+        return self.df
+
+    def add_cycle_exhaustion_features(self):
+        """
+        Calculates advanced cycle and exhaustion features for better dip/peak prediction:
+        - Cycle Length: Length of current leg (dip-to-peak or peak-to-dip)
+        - Price Exhaustion: How much price has moved in recent periods
+        - Momentum Decay: Rate of RSI decline after peaks
+        - Volatility Expansion: ATR expansion rate
+        - Trend Exhaustion: Multiple exhaustion signals combined
+        """
+        # Ensure required columns exist
+        if "RSI" not in self.df.columns:
+            self.add_rsi()
+        if "ATR" not in self.df.columns:
+            self.add_atr(14)
+        if "Dip" not in self.df.columns or "Tepe" not in self.df.columns:
+            # ZigZag labels should be added before this
+            pass
+        
+        # =====================================================
+        # 1. CYCLE LENGTH (Current leg duration)
+        # =====================================================
+        # Calculate days since last pivot (already exists, but we need cycle length)
+        if "Days_Since_Last_Pivot" in self.df.columns:
+            # Current cycle length is Days_Since_Last_Pivot
+            self.df["Cycle_Length"] = self.df["Days_Since_Last_Pivot"]
+        else:
+            self.df["Cycle_Length"] = 0
+        
+        # Historical average cycle length (rolling window of last 5 cycles)
+        if "Last_Signal" in self.df.columns:
+            # Find pivot points using integer positions
+            is_pivot = self.df["Dip"].notna() | self.df["Tepe"].notna()
+            pivot_positions = self.df[is_pivot].index.tolist()
+            
+            if len(pivot_positions) >= 2:
+                # Calculate cycle lengths between pivots (using integer positions)
+                cycle_lengths = []
+                for i in range(1, len(pivot_positions)):
+                    # Get integer position in dataframe
+                    pos1 = self.df.index.get_loc(pivot_positions[i-1])
+                    pos2 = self.df.index.get_loc(pivot_positions[i])
+                    cycle_len = pos2 - pos1
+                    cycle_lengths.append(float(cycle_len))
+                
+                # Rolling average of last 5 cycles
+                if len(cycle_lengths) > 0:
+                    # Map each row to its average cycle length
+                    avg_cycle_values = []
+                    for idx_pos in range(len(self.df)):
+                        # Find which cycle this position belongs to
+                        cycle_idx = 0
+                        for i in range(1, len(pivot_positions)):
+                            pos1 = self.df.index.get_loc(pivot_positions[i-1])
+                            pos2 = self.df.index.get_loc(pivot_positions[i])
+                            if pos1 <= idx_pos < pos2:
+                                cycle_idx = i - 1
+                                break
+                        
+                        if cycle_idx < len(cycle_lengths):
+                            # Use last 5 cycles for average
+                            recent_cycles = cycle_lengths[max(0, cycle_idx-4):cycle_idx+1]
+                            avg_cycle_values.append(np.mean(recent_cycles) if recent_cycles else 0.0)
+                        else:
+                            # Use overall average
+                            avg_cycle_values.append(np.mean(cycle_lengths[-5:]) if len(cycle_lengths) >= 5 else np.mean(cycle_lengths) if cycle_lengths else 0.0)
+                    
+                    self.df["Avg_Cycle_Length"] = avg_cycle_values
+                    # Normalized cycle length (current / average)
+                    self.df["Cycle_Length_Ratio"] = np.where(
+                        self.df["Avg_Cycle_Length"] > 0,
+                        self.df["Cycle_Length"] / self.df["Avg_Cycle_Length"],
+                        1.0
+                    )
+                else:
+                    self.df["Avg_Cycle_Length"] = 0.0
+                    self.df["Cycle_Length_Ratio"] = 1.0
+            else:
+                self.df["Avg_Cycle_Length"] = 0.0
+                self.df["Cycle_Length_Ratio"] = 1.0
+        else:
+            self.df["Avg_Cycle_Length"] = 0.0
+            self.df["Cycle_Length_Ratio"] = 1.0
+        
+        # =====================================================
+        # 2. PRICE EXHAUSTION (How much price moved recently)
+        # =====================================================
+        # Price exhaustion in last 5, 10, 20 days
+        price_5d = self.df[self.price_col].pct_change(5)
+        price_10d = self.df[self.price_col].pct_change(10)
+        price_20d = self.df[self.price_col].pct_change(20)
+        
+        self.df["Price_Exhaustion_5D"] = price_5d.fillna(0)
+        self.df["Price_Exhaustion_10D"] = price_10d.fillna(0)
+        self.df["Price_Exhaustion_20D"] = price_20d.fillna(0)
+        
+        # Normalized by ATR (volatility-adjusted exhaustion)
+        atr_normalized = self.df["ATR"] / self.df[self.price_col]
+        price_exhaustion_atr = np.where(
+            atr_normalized > 0,
+            price_5d / atr_normalized,
+            0
+        )
+        self.df["Price_Exhaustion_5D_ATR"] = pd.Series(price_exhaustion_atr, index=self.df.index).fillna(0)
+        
+        # Maximum price move in last N days (peak exhaustion)
+        rolling_high_10 = self.df[self.price_col].rolling(10).max()
+        rolling_low_10 = self.df[self.price_col].rolling(10).min()
+        self.df["Price_Range_10D"] = (rolling_high_10 - rolling_low_10) / rolling_low_10
+        
+        # =====================================================
+        # 3. MOMENTUM DECAY (RSI decline rate after peaks)
+        # =====================================================
+        # RSI momentum decay: How fast RSI is falling
+        rsi_decay_1d = -self.df["RSI"].diff(1)  # Negative diff = decay
+        rsi_decay_3d = -self.df["RSI"].diff(3) / 3
+        rsi_decay_5d = -self.df["RSI"].diff(5) / 5
+        
+        self.df["RSI_Decay_1D"] = rsi_decay_1d.fillna(0)
+        self.df["RSI_Decay_3D"] = rsi_decay_3d.fillna(0)
+        self.df["RSI_Decay_5D"] = rsi_decay_5d.fillna(0)
+        
+        # RSI acceleration (change in decay rate)
+        self.df["RSI_Decay_Accel"] = self.df["RSI_Decay_1D"].diff().fillna(0)
+        
+        # =====================================================
+        # 4. VOLATILITY EXPANSION (ATR expansion rate)
+        # =====================================================
+        # ATR expansion: How much volatility has increased
+        atr_expansion_5d = self.df["ATR"].pct_change(5)
+        atr_expansion_10d = self.df["ATR"].pct_change(10)
+        
+        self.df["ATR_Expansion_5D"] = atr_expansion_5d.fillna(0)
+        self.df["ATR_Expansion_10D"] = atr_expansion_10d.fillna(0)
+        
+        # ATR vs historical average (last 20 days)
+        atr_avg_20 = self.df["ATR"].rolling(20).mean()
+        atr_vs_avg = np.where(
+            atr_avg_20 > 0,
+            (self.df["ATR"] - atr_avg_20) / atr_avg_20,
+            0
+        )
+        self.df["ATR_vs_Avg"] = pd.Series(atr_vs_avg, index=self.df.index).fillna(0)
+        
+        # =====================================================
+        # 5. TREND EXHAUSTION COMPOSITE
+        # =====================================================
+        # Combine multiple exhaustion signals
+        # High RSI + Long overbought duration + Price exhaustion + Cycle length
+        rsi_exhaustion = (self.df["RSI"] > 75).astype(int)
+        ob_duration_exhaustion = (self.df["RSI_Overbought_Days"] > 5).astype(int)
+        price_exhaustion = (self.df["Price_Exhaustion_10D"] > 0.05).astype(int)  # 5%+ move
+        cycle_exhaustion = (self.df["Cycle_Length_Ratio"] > 1.2).astype(int)  # 20% longer than avg
+        
+        # Composite exhaustion score (0-4)
+        self.df["Trend_Exhaustion_Score"] = (
+            rsi_exhaustion + 
+            ob_duration_exhaustion + 
+            price_exhaustion + 
+            cycle_exhaustion
+        )
+        
+        # For dips: Oversold + Long oversold duration + Price exhaustion down
+        rsi_oversold = (self.df["RSI"] < 25).astype(int)
+        os_duration_exhaustion = (self.df.get("RSI_Oversold_Days", 0) > 3).astype(int)
+        price_exhaustion_down = (self.df["Price_Exhaustion_10D"] < -0.05).astype(int)  # -5%+ move
+        
+        self.df["Dip_Exhaustion_Score"] = (
+            rsi_oversold + 
+            os_duration_exhaustion + 
+            price_exhaustion_down + 
+            cycle_exhaustion
+        )
+        
+        # =====================================================
+        # 6. PRICE BLOWOFF (Extreme price moves)
+        # =====================================================
+        # Price blowoff: Extreme moves that often precede reversals
+        price_change_abs = self.df[self.price_col].pct_change().abs()
+        blowoff_threshold = price_change_abs.rolling(20).quantile(0.95)  # Top 5% moves
+        
+        self.df["Price_Blowoff"] = (price_change_abs > blowoff_threshold).astype(int)
+        
+        # Volume-confirmed blowoff (if volume data exists)
+        if "vol." in self.df.columns:
+            vol_avg = self.df["vol."].rolling(20).mean()
+            vol_spike = (self.df["vol."] > vol_avg * 1.5).astype(int)
+            self.df["Volume_Blowoff"] = (self.df["Price_Blowoff"] & vol_spike).astype(int)
+        else:
+            self.df["Volume_Blowoff"] = 0
         
         return self.df
 
