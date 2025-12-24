@@ -5,11 +5,11 @@ import plotly.graph_objects as go
 
 def render_header():
     """Renders the main page header and description."""
-    st.title("📈 BIST100 Decision Support (Professional)")
+    st.title("📈 BIST100 Karar Destek Sistemi")
     st.markdown(
         """
-        **AI-Powered Market Regime & Trend Analysis**  
-        This dashboard identifies pivotal market levels, regime states, and provides actionable data-driven insights.
+        **Yapay Zeka Destekli Piyasa Rejimi ve Trend Analizi**  
+        Bu panel, kritik dönüş noktalarını, piyasa rejimini ve veriye dayalı öngörüleri sağlar.
         """
     )
     st.divider()
@@ -20,71 +20,80 @@ def render_kpi_metrics(df_window: pd.DataFrame,
     """
     Renders the KPI summary strip with Predictive Analytics.
     """
-    st.subheader("📌 Market Position & AI Predictions")
+    st.subheader("📌 Piyasa Durumu ve AI Öngörüleri")
 
-    if "price" not in df_window.columns:
-        st.warning("Price data missing for KPI calculation.")
+    if df_window.empty:
+        st.warning("Görüntülenecek geçmiş veri bulunamadı.")
         return
 
-    last_price = df_window.iloc[-1]["price"]
-    regime = df_window.iloc[-1].get("Regime", "Unknown")
-    rsi = df_window.iloc[-1].get("RSI", 50)
+    # Safe column retrieval
+    row = df_window.iloc[-1]
+    last_price = row["price"]
+    regime = row.get("Regime", "Unknown")
+    rsi = row.get("RSI", row.get("rsi_14", 50))
     
-    # Layout: Price | Regime | RSI | Dip Prediction | Peak Prediction | Trend Prediction
+    # Translate Regime
+    regime_tr = {"Bullish": "Boğa (Yükseliş)", "Bearish": "Ayı (Düşüş)", "Recovery": "Toparlanma", "Warning": "Zayıflama"}.get(regime, regime)
+    
     kpi1, kpi2, kpi3, kpi4, kpi5, kpi6 = st.columns(6)
-    
-    # 1. Price
-    kpi1.metric("Last Price", f"{last_price:,.2f}")
-    
-    # 2. Regime
-    kpi2.metric("Regime", regime)
-
-    # 3. RSI
+    kpi1.metric("Son Fiyat", f"{last_price:,.2f}")
+    kpi2.metric("Piyasa Rejimi", regime_tr)
     kpi3.metric("RSI (14)", f"{rsi:.1f}")
 
-    # 4. DIP Prediction
-    # Showing Probability AND Model Precision (Accuracy confidence)
-    dip_delta = "High Conf." if dip_acc > 0.6 else "Mod. Conf."
     kpi4.metric(
-        "🔮 Dip Probability", 
+        "🔮 Dip Olasılığı", 
         f"%{dip_prob*100:.1f}", 
-        delta=f"Acc: %{dip_acc*100:.0f}" if dip_prob > 0.5 else None,
+        delta=f"Başarı: %{dip_acc*100:.0f}" if dip_prob > 0.5 else None,
         delta_color="normal"
     )
 
-    # 5. PEAK Prediction
-    peak_delta = "High Conf." if peak_acc > 0.6 else "Mod. Conf."
     kpi5.metric(
-        "🔮 Peak Probability", 
+        "🔮 Zirve Olasılığı", 
         f"%{peak_prob*100:.1f}", 
-        delta=f"Acc: %{peak_acc*100:.0f}" if peak_prob > 0.5 else None,  
+        delta=f"Başarı: %{peak_acc*100:.0f}" if peak_prob > 0.5 else None,  
         delta_color="inverse"
     )
     
-    # 6. Trend / Neutral (The "Missing" %)
-    # Since models are independent, we estimate neutral as roughly the remainder.
-    # We clip to 0 to avoid negative numbers in edge cases.
     neutral_prob = max(0.0, 1.0 - (dip_prob + peak_prob))
     kpi6.metric(
-        "➡️ Trend Prob",
+        "➡️ Trend Devamı",
         f"%{neutral_prob*100:.1f}",
-        delta="Continuation"
+        delta="Yatay/Trend"
     )
     
-    # Signal Interpretation Banner
     st.divider()
-    
     col_info, col_help = st.columns([4, 1])
     with col_help:
-        st.caption("ℹ️ **Note on Probabilities**:\n'Dip' & 'Peak' are specific reversal events. They don't sum to 100% because the market is usually in **Trend Continuation** (Neutral).")
+        st.caption("ℹ️ **Olasılık Hakkında Not**:\n'Dip' ve 'Zirve' dönüş sinyalleridir. Toplamları %100 etmeyebilir, çünkü piyasa genellikle **Trend Devamı** (Nötr) aşamasındadır.")
     
     with col_info:
-        if dip_prob > 0.65:
-            st.success(f"🟢 **POSSIBLE BOTTOM**: Model detects %{dip_prob*100:.0f} chance of a swing low. (Model Precision: %{dip_acc*100:.0f})")
-        elif peak_prob > 0.65:
-            st.error(f"🔴 **POSSIBLE TOP**: Model detects %{peak_prob*100:.0f} chance of a swing high. (Model Precision: %{peak_acc*100:.0f})")
+        # NEW: Signal Purity Logic (User's Formula)
+        # Gap = Peak% - Dip% 
+        # Check if Gap > 48% of RSI
+        # Peak Purity Logic
+        gap = (peak_prob - dip_prob) * 100
+        threshold = rsi * 0.48
+        
+        # Dip Purity Logic (Hybrid: 85%|1.1x OR 72%|1.3x)
+        dip_gap = (dip_prob - peak_prob) * 100
+        is_pure_dip = ((dip_prob >= 0.85 and dip_gap > rsi * 1.1) or 
+                       (dip_prob >= 0.72 and dip_gap > rsi * 1.3))
+        
+        if is_pure_dip:
+            st.success(f"🟢 **SAF DİP SİNYALİ**: Model %{dip_prob*100:.0f} güvenle tertemiz bir dip bölgesi öngörüyor. (Fark: {dip_gap:.1f})")
+        elif dip_prob >= 0.72:
+            st.info(f"⚪ **DİP DOYGUNLUĞU**: Dip olasılığı (%{dip_prob*100:.0f}) yüksek ancak saflık barajı geçilemedi.")
+        elif dip_prob > 0.60:
+            st.success(f"🟢 **DİP BÖLGESİ**: Model %{dip_prob*100:.0f} ihtimalle bir dip bölgesinde olduğumuzu öngörüyor.")
+        elif peak_prob >= 0.85:
+             if gap > threshold:
+                 st.error(f"🔴 **SAF ZİRVE SİNYALİ**: Model %{peak_prob*100:.0f} güvenle tertemiz bir zirve sinyali üretiyor. (Fark: {gap:.1f} > Baraj: {threshold:.1f})")
+             else:
+                 st.info(f"⚪ **ZİRVE DOYGUNLUĞU**: Zirve olasılığı yüksek (%{peak_prob*100:.0f}) ancak Dip emaresi de yükseldiği için sinyal saflığını yitirdi. Baraj ({threshold:.1f}) geçilemedi.")
+        elif peak_prob > 0.70:
+            st.error(f"🟠 **OLASI ZİRVE**: Model %{peak_prob*100:.0f} ihtimalle zirve uyarısı veriyor.")
         else:
-            st.info(f"👉 **TREND CONTINUATION**: The market is likely to continue its current path (Neutral/Trend Probability: %{neutral_prob*100:.1f}). No strong reversal imminent.")
+            st.info(f"👉 **TREND DEVAMI**: Piyasa şu anki yolunda devam etme eğiliminde.")
 
 def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: pd.Timestamp = None):
     """
@@ -279,40 +288,109 @@ def render_plotly_chart(df_window: pd.DataFrame, date_col: str, selected_date: p
 
 def render_ai_insights(df_window: pd.DataFrame, dip_prob: float = 0.0, peak_prob: float = 0.0):
     """
-    Generates natural language insights based on technical state.
+    Kritik uyarılar ve trend analizi.
     """
     st.subheader("🤖 AI Insight Engine")
     
+    if df_window.empty:
+        st.write("Analiz edilecek veri bulunamadı.")
+        return
+        
     last_row = df_window.iloc[-1]
-    rsi = last_row.get("RSI", 50)
+    rsi = last_row.get("RSI", last_row.get("rsi_14", 50))
     regime = last_row.get("Regime", "Unknown")
     
-    insights = []
-    
-    # ML Logic (Priority)
-    if dip_prob > 0.60:
-        insights.append(f"🟢 **POSSIBLE BUY SIGNAL**: AI Model detects a local **Dip** with {dip_prob:.0%} confidence.")
-    elif peak_prob > 0.60:
-        insights.append(f"🔴 **POSSIBLE SELL SIGNAL**: AI Model detects a local **Peak** with {peak_prob:.0%} confidence.")
+    # Purity Check - PEAK (User's Formula: Gap > RSI * 0.48)
+    gap = (peak_prob - dip_prob) * 100
+    threshold = rsi * 0.48
+    is_pure = (peak_prob >= 0.85) and (gap > threshold)
 
-    # RSI Logic
+    # Purity Check - DIP (Hybrid Logic: 85%|1.1x OR 72%|1.3x)
+    dip_gap = (dip_prob - peak_prob) * 100
+    is_pure_dip = ((dip_prob >= 0.85 and dip_gap > rsi * 1.1) or 
+                   (dip_prob >= 0.72 and dip_gap > rsi * 1.3))
+    
+    # Show CURRENT Pure Status as a Priority Box
+    if is_pure:
+        st.error(f"🔴 **SAF ZİRVE SİNYALİ TESPİT EDİLDİ**: Mevcut teknik veriler %{peak_prob*100:.0f} güvenle tertemiz bir zirveyi işaret ediyor. (Purity Gap: {gap:.1f} > Baraj: {threshold:.1f})")
+    elif is_pure_dip:
+        st.success(f"🟢 **SAF DİP SİNYALİ TESPİT EDİLDİ**: Mevcut teknik veriler %{dip_prob*100:.0f} güvenle tertemiz bir dibi işaret ediyor. (Fark: {dip_gap:.1f})")
+    else:
+        st.info("ℹ️ **PİYASA GÖRÜNÜMÜ**: Şu an için 'Saf' bir dönüş sinyali veya aşırı doygunluk emaresi saptanmadı. Piyasa mevcut trendini koruyor.")
+    
+    # Check Persistence (Last 5 Days)
+    if "AI_Peak_Prob" in df_window.columns:
+        last_5_days = df_window.tail(5)
+        
+        red_signals = (last_5_days["AI_Peak_Prob"] > 0.70).sum()
+        yellow_signals = ((last_5_days["AI_Peak_Prob"] > 0.50) & 
+                        (last_5_days["AI_Peak_Prob"] <= 0.70)).sum()
+        
+        green_signals = (last_5_days["AI_Dip_Prob"] > 0.70).sum()
+        light_green_signals = ((last_5_days["AI_Dip_Prob"] > 0.50) & 
+                            (last_5_days["AI_Dip_Prob"] <= 0.70)).sum()
+        
+        # Rule 1: 3/3 RED (Hyper-Critical)
+        if len(last_5_days) >= 3:
+            last_3_peak = last_5_days["AI_Peak_Prob"].iloc[-3:]
+            if (last_3_peak > 0.70).all():
+                if is_pure:
+                    if peak_prob > 0.90 and dip_prob > 0.45:
+                        st.error("🌪️ **PİYASA KLİMAKSI (Final Zirve)**: Zirve sinyali doygunluğa ulaştı ve model artık karşı yönde emareler görüyor. Dönüş an meselesi! (Güven: %97+)")
+                    else:
+                        st.error("🚨 **HİPER-KRİTİK ZİRVE UYARISI**: Model son 3 gündür ARALIKSIZ yüksek güvenli (%70+) sinyal üretiyor.")
+                else:
+                    st.info(f"🌫️ **SİNYAL DOYGUNLUĞU**: Israrlı sinyaller mevcut ancak saflık barajı ({threshold:.1f}) geçilemediği için alarm susturuldu.")
+            
+            # Rule 1-Dip: 3/3 GREEN (Hyper-Dip)
+            last_3_dip = last_5_days["AI_Dip_Prob"].iloc[-3:]
+            if (last_3_dip > 0.70).all():
+                if is_pure_dip:
+                    st.success(f"💎 **HİPER-KRİTİK DİP UYARISI**: Model son 3 gündür ARALIKSIZ tertemiz dip sinyali üretiyor.")
+                else:
+                    st.info(f"🌫️ **DİP DOYGUNLUĞU**: Israrlı dip sinyalleri var ancak saflık barajı geçilemedi.")
+        
+        # Rule 2: 2 Red + max 2 Yellow (Critical Peak)
+        is_bullseye_peak = (last_5_days["AI_Peak_Prob"] > 0.85).any()
+        if ((red_signals >= 2 and yellow_signals <= 2) or is_bullseye_peak) and is_pure:
+            st.warning(f"🛑 **KRİTİK ZİRVE UYARISI**: Son 5 günde {red_signals} yüksek güvenli zirve sinyali algılandı.")
+
+        # Rule 2-Dip: 2 Green + max 2 Light Green (Critical Dip)
+        is_bullseye_dip = (last_5_days["AI_Dip_Prob"] > 0.85).any()
+        if ((green_signals >= 2 and light_green_signals <= 2) or is_bullseye_dip) and is_pure_dip:
+            st.success(f"🛡️ **GÜVENLİ ALIM BÖLGESİ**: Son 5 günde {green_signals} yüksek güvenli dip sinyali algılandı.")
+
+        # Audit Log
+        with st.expander("🔍 Sinyal Detayları (Son 5 Gün)"):
+            for idx, row in last_5_days.iterrows():
+                d_val = row.get("date", row.get("Date", None))
+                d_str = d_val.strftime('%d.%m.%Y') if d_val else "Gün"
+                p_peak = row["AI_Peak_Prob"]
+                p_dip = row.get("AI_Dip_Prob", 0.0)
+                
+                if p_peak > 0.70:
+                    msg = f"🔴 **ZİRVE** (%{p_peak*100:.0f}) | Dip: %{p_dip*100:.0f}"
+                elif p_dip > 0.70:
+                    msg = f"🟢 **DİP** (%{p_dip*100:.0f}) | Zirve: %{p_peak*100:.0f}"
+                elif p_peak > 0.50:
+                    msg = f"🟠 Olası Zirve (%{p_peak*100:.0f})"
+                elif p_dip > 0.50:
+                    msg = f"🔵 Olası Dip (%{p_dip*100:.0f})"
+                else:
+                    msg = f"⚪ Nötr (Z:%{p_peak*100:.0f} D:%{p_dip*100:.0f})"
+                st.write(f"{d_str}: {msg}")
+
+    # RSI Insights
     if rsi > 70:
-        insights.append(f"⚠️ **RSI Overbought ({rsi:.1f})**: Momentum is stretched. Reversal risk high.")
+        st.info(f"⚠️ **RSI Aşırı Alım ({rsi:.1f})**: Momentum çok şişti. Düzeltme riski yüksek.")
     elif rsi < 30:
-        insights.append(f"✅ **RSI Oversold ({rsi:.1f})**: Potential mean reversion. Watch for stabilization.")
+        st.info(f"✅ **RSI Aşırı Satım ({rsi:.1f})**: Momentum çok düştü. Tepki alımı gelebilir.")
         
-    # Regime Logic
+    # Regime Insights
     if regime == "Bullish":
-        insights.append("🐂 **Primary Trend**: Uptrend. Look for confirmed dips to enter.")
+        st.info("🐂 **Ana Trend: Yükseliş (Boğa)**. Düşüşler alım fırsatı olabilir.")
     elif regime == "Bearish":
-        insights.append("🐻 **Primary Trend**: Downtrend. Rallies are likely selling opportunities.")
-        
-    # Display
-    for insight in insights:
-        st.info(insight)
-        
-    if not insights:
-        st.write("Market is behaving within normal parameters. No strong signals.")
+        st.info("🐻 **Ana Trend: Düşüş (Ayı)**. Yükselişler satış fırsatı olabilir.")
 
 def render_scenario_simulator(ml_engine, current_row: pd.Series):
     """

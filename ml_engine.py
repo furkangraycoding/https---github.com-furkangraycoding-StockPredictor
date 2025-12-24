@@ -3,6 +3,7 @@ import numpy as np
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import TimeSeriesSplit, RandomizedSearchCV
 from sklearn.metrics import precision_score, accuracy_score, recall_score, f1_score, make_scorer
+from sklearn.calibration import CalibratedClassifierCV
 from indicators import TechnicalAnalyzer
 import streamlit as st
 
@@ -12,9 +13,9 @@ class MLEngine:
         
         # Default Parameters (will be updated by tuning)
         self.rf_params = {
-            "n_estimators": 200,
-            "max_depth": 10,
-            "min_samples_leaf": 4,
+            "n_estimators": 300,
+            "max_depth": 15,
+            "min_samples_leaf": 1, # More aggressive to allow higher confidence
             "class_weight": "balanced",
             "n_jobs": -1,
             "random_state": 42
@@ -29,40 +30,48 @@ class MLEngine:
         # =====================================================
         # QUANTITATIVE FEATURE SET
         # =====================================================
-        self.features = [
-            # Momentum
-            "RSI_14",
-            "Williams_%R",
-            "CCI_20",
-            "StochRSI",
-            "VAM", # Volatility Adjusted Momentum
-            
-            # Volatility & Risk
-            "Volatility_20",
-            "ATR",
-            "BB_Position",
-            
-            # Trend & Regime
-            "Dist_SMA200",
-            "MACD_Hist",
-            "DI_Diff",
+        # =====================================================
+        # FEATURE SET DEFINITIONS
+        # =====================================================
+        self.all_features = [
+            "RSI_14", "Williams_%R", "CCI_20", "StochRSI", "VAM", 
+            "Volatility_20", "ATR", "BB_Position", "Dist_SMA200", 
+            "MACD_Hist", "DI_Diff", "ADX_14", "Drawdown_Pct", "Rally_Pct", 
+            "RSI_Diff_1D", "Cycle_Phase", "MFI_14", "Vol_ZScore", 
+            "Kurtosis_20", "Fractal_High", "Fractal_Low", "RSI_Price_Corr_14",
+            "RSI_Overbought_Days", "Leg_Return"
+        ]
+        
+        # DIP MODEL: Can use everything (It works well)
+        self.dip_features = self.all_features.copy()
+        
+        # PEAK MODEL: RESTRICTED SET
+        # We remove purely price-based/volatility features that dominate signal
+        # to force the model to look at Overbought/Momentum exhaustion indicators.
+        self.peak_features = [
+            "RSI_14", 
+            "Williams_%R", 
+            "CCI_20", 
+            "StochRSI", 
+            "VAM", 
+            "ATR", # Valid for stop loss logic, maybe keep
+            "BB_Position", 
+            "MACD_Hist", 
+            "DI_Diff", 
             "ADX_14",
-            
-            # Drawdown / Rally
-            "Drawdown_Pct",
-            "Rally_Pct",
-            
-            # NEW: RSI Delta & Time Decay
-            # NEW: RSI Delta & Time Decay
-            "RSI_Diff_1D",
-            "Cycle_Phase", # Dynamic Binned Time (0, 1, 2)
-            
-            # NEW: Advanced Optimization Features
-            "MFI_14",
-            "Vol_ZScore",
-            "Kurtosis_20",
-            "Fractal_High",
-            "Fractal_Low"
+            # "Volatility_20", # REMOVED
+            # "Dist_SMA200",   # REMOVED
+            # "Drawdown_Pct",  # REMOVED
+            # "Rally_Pct",     # REMOVED
+            "RSI_Diff_1D", 
+            # "Cycle_Phase",   # REMOVED to force Technical Analysis usage
+            "MFI_14", 
+            "Vol_ZScore", 
+            "Kurtosis_20", 
+            "Fractal_High", 
+            "Fractal_Low",
+            "RSI_Price_Corr_14", # Divergence
+            "RSI_Overbought_Days" # Time Decay
         ]
 
     def prepare_data(self):
@@ -89,22 +98,40 @@ class MLEngine:
         # LABEL EXPANSION (Smearing):
         # Predicting the exact single day of a pivot is extremely hard.
         # We expand the target to include +/- 2 days around the pivot.
-        # This teaches the model to identify the "Turning Phase" not just a single point.
+        # LABEL EXPANSION & EXHAUSTION (Smearing):
+        # Generate Required Indicators for Labeling
+        analyzer = TechnicalAnalyzer(self.df)
+        analyzer.add_rsi()
+        analyzer.add_atr()
+        
+        # ADVANCED LABELING:
+        # 1. Technical ZigZag Labels
+        analyzer.add_zigzag_labels(threshold_pct=0.03, atr_factor=2.5)
+        self.df = analyzer.get_df()
         
         raw_dip = np.where(self.df["Dip"].notna(), 1, 0)
-        raw_peak = np.where(self.df["Tepe"].notna(), 1, 0)
-        
-        # Window=5 with center=True covers: [t-2, t-1, t, t+1, t+2]
         self.df["Label_Dip"] = pd.Series(raw_dip).rolling(window=5, min_periods=1, center=True).max().fillna(0).astype(int)
-        self.df["Label_Peak"] = pd.Series(raw_peak).rolling(window=5, min_periods=1, center=True).max().fillna(0).astype(int)
+        
+        raw_peak = np.where(self.df["Tepe"].notna(), 1, 0)
+        zigzag_peak_labels = pd.Series(raw_peak).rolling(window=7, min_periods=1).max().shift(-4).fillna(0)
+        
+        # 2. Exhaustion/Danger Zone Labels (Peak only)
+        # Use 'RSI' (TechnicalAnalyzer default)
+        recent_high = self.df["high"].rolling(window=10).max()
+        proximity_to_high = self.df["high"] / recent_high
+        exhaustion_zone = (self.df["RSI"] > 70) & (proximity_to_high >= 0.98)
+        
+        # Combine: Either a confirmed ZigZag peak OR an exhaustion zone
+        self.df["Label_Peak"] = ((zigzag_peak_labels == 1) | (exhaustion_zone)).astype(int)
         
         # Normalize/Fill Features
-        for col in self.features:
+        for col in self.all_features:
             if col not in self.df.columns:
                 self.df[col] = 0
         
         # Drop NaN rows (start of history)
-        self.df.dropna(subset=self.features, inplace=True)
+        # Use only common/all features for dropna check to be safe
+        self.df.dropna(subset=self.all_features, inplace=True)
         
         return self.df
 
@@ -145,82 +172,114 @@ class MLEngine:
 
     def train(self, optimize=True):
         """
-        Trains directly on State-Filtered Data.
+        Trains directly on State-Filtered Data using Strict Time-Series Split.
+        Blind Test Check: Model uses first 70% data to learn, predicts on last 30%.
         """
         data = self.prepare_data()
         
         # FEATURE DROPOUT (Regularization)
-        # Randomly mask 'Cycle_Phase' in 30% of training data to force reliance on Technicals.
         if "Cycle_Phase" in data.columns:
-             # Using a fixed seed for reproducibility of the dropout mask if needed, but random is fine for robustness
-             # Set to -1 (which the tree will treat as a separate category or 'unknown')
-             # This teaches the model: "Sometimes you don't know the time, so look at RSI!"
              mask = np.random.rand(len(data)) < 0.30
              data.loc[mask, "Cycle_Phase"] = -1
         
         if data.empty:
             return {}, pd.DataFrame()
-            
+
+        # STRICT TRAIN/TEST SPLIT
+        split_idx = int(len(data) * 0.70)
+        train_data = data.iloc[:split_idx].copy()
+        test_data = data.iloc[split_idx:].copy() # Future/Blind Data
+        
         metrics = {"dip": {}, "peak": {}}
         tscv = TimeSeriesSplit(n_splits=3)
         
-        # 1. Train DIP Model (Only when Last Signal was PEAK -> -1)
-        # We also include 0 (Unknown) to provide some initial training data if needed, 
-        # but strict logic says -1. Let's include 0 for robustness at start.
-        dip_mask = (data["Last_Signal"] == -1) | (data["Last_Signal"] == 0)
-        X_dip = data.loc[dip_mask, self.features]
-        y_dip = data.loc[dip_mask, "Label_Dip"]
+        # 1. Train DIP Model (Use TRAIN DATA Only)
+        dip_mask = (train_data["Last_Signal"] == -1) | (train_data["Last_Signal"] == 0)
+        X_dip = train_data.loc[dip_mask, self.dip_features]
+        y_dip = train_data.loc[dip_mask, "Label_Dip"]
         
-        if y_dip.sum() > 0:
-            if optimize:
-                self.dip_model = self.tune_hyperparameters(X_dip, y_dip, "Dip")
+        if not X_dip.empty and y_dip.sum() > 0:
+            # First Pass: Feature Importance Selection
+            base_dip = RandomForestClassifier(n_estimators=100, random_state=42)
+            base_dip.fit(X_dip, y_dip)
+            imps = pd.Series(base_dip.feature_importances_, index=self.dip_features)
+            self.dip_features = imps[imps >= 0.05].index.tolist()
             
-            # CV Evaluation
-            precs, recs, accs = [], [], []
-            for train_idx, test_idx in tscv.split(X_dip):
-                X_train, X_test = X_dip.iloc[train_idx], X_dip.iloc[test_idx]
-                y_train, y_test = y_dip.iloc[train_idx], y_dip.iloc[test_idx]
-                
-                self.dip_model.fit(X_train, y_train)
-                preds = self.dip_model.predict(X_test)
-                precs.append(precision_score(y_test, preds, zero_division=0))
-                recs.append(recall_score(y_test, preds, zero_division=0))
-                accs.append(accuracy_score(y_test, preds))
+            # If all features dropped (rare), keep top 3
+            if not self.dip_features:
+                 self.dip_features = imps.sort_values(ascending=False).head(3).index.tolist()
             
-            self.dip_model.fit(X_dip, y_dip)
-            metrics["dip"]["precision"] = np.mean(precs) if precs else 0.0
-            metrics["dip"]["recall"] = np.mean(recs) if recs else 0.0
-            metrics["dip"]["accuracy"] = np.mean(accs) if accs else 0.0
-        
-        # 2. Train PEAK Model (Only when Last Signal was DIP -> 1)
-        peak_mask = (data["Last_Signal"] == 1) | (data["Last_Signal"] == 0)
-        X_peak = data.loc[peak_mask, self.features]
-        y_peak = data.loc[peak_mask, "Label_Peak"]
-
-        if y_peak.sum() > 0:
+            # Second Pass: Final model with selected features
+            X_dip_selected = X_dip[self.dip_features]
             if optimize:
-                self.peak_model = self.tune_hyperparameters(X_peak, y_peak, "Peak")
+                self.dip_model = self.tune_hyperparameters(X_dip_selected, y_dip, "Dip")
+            
+            self.dip_model.fit(X_dip_selected, y_dip)
+            
+            # Evaluate on Test Set (Blind) using SELECTED features
+            test_dip_mask = (test_data["Last_Signal"] == -1) | (test_data["Last_Signal"] == 0)
+            if test_dip_mask.sum() > 0:
+                X_test_dip = test_data.loc[test_dip_mask, self.dip_features]
+                y_test_dip = test_data.loc[test_dip_mask, "Label_Dip"]
                 
-            precs, recs, accs = [], [], []
-            for train_idx, test_idx in tscv.split(X_peak):
-                X_train, X_test = X_peak.iloc[train_idx], X_peak.iloc[test_idx]
-                y_train, y_test = y_peak.iloc[train_idx], y_peak.iloc[test_idx]
-                
-                self.peak_model.fit(X_train, y_train)
-                preds = self.peak_model.predict(X_test)
-                precs.append(precision_score(y_test, preds, zero_division=0))
-                recs.append(recall_score(y_test, preds, zero_division=0))
-                accs.append(accuracy_score(y_test, preds))
+                preds = self.dip_model.predict(X_test_dip)
+                metrics["dip"]["precision"] = precision_score(y_test_dip, preds, zero_division=0)
+                metrics["dip"]["recall"] = recall_score(y_test_dip, preds, zero_division=0)
+                metrics["dip"]["accuracy"] = accuracy_score(y_test_dip, preds)
+            else:
+                metrics["dip"] = {"precision": 0, "recall": 0, "accuracy": 0}
 
-            self.peak_model.fit(X_peak, y_peak)
-            metrics["peak"]["precision"] = np.mean(precs) if precs else 0.0
-            metrics["peak"]["recall"] = np.mean(recs) if recs else 0.0
-            metrics["peak"]["accuracy"] = np.mean(accs) if accs else 0.0
+        # 2. Train PEAK Model (Use TRAIN DATA Only)
+        peak_mask = (train_data["Last_Signal"] == 1) | (train_data["Last_Signal"] == 0)
+        X_peak = train_data.loc[peak_mask, self.peak_features]
+        y_peak = train_data.loc[peak_mask, "Label_Peak"]
+
+        if not X_peak.empty and y_peak.sum() > 0:
+            # First Pass: Feature Importance Selection
+            base_peak = RandomForestClassifier(n_estimators=100, random_state=42)
+            base_peak.fit(X_peak, y_peak)
+            imps = pd.Series(base_peak.feature_importances_, index=self.peak_features)
+            self.peak_features = imps[imps >= 0.05].index.tolist()
+            
+            # If all features dropped, keep top 3
+            if not self.peak_features:
+                 self.peak_features = imps.sort_values(ascending=False).head(3).index.tolist()
+
+            # Prepare Training Set with SELECTED features
+            X_peak_selected = X_peak[self.peak_features]
+            pos_mask = (y_peak == 1)
+            X_peak_pos = X_peak_selected[pos_mask]
+            y_peak_pos = y_peak[pos_mask]
+            
+            X_peak_oversampled = pd.concat([X_peak_selected] + [X_peak_pos]*10)
+            y_peak_oversampled = pd.concat([y_peak] + [y_peak_pos]*10)
+            
+            if optimize:
+                self.peak_model = self.tune_hyperparameters(X_peak_oversampled, y_peak_oversampled, "Peak")
+            else:
+                self.peak_model = RandomForestClassifier(
+                    n_estimators=300, 
+                    max_depth=15, 
+                    min_samples_leaf=1, 
+                    random_state=42
+                )
+                
+            self.peak_model.fit(X_peak_oversampled, y_peak_oversampled)
+            
+            # Evaluate on Test Set (Blind)
+            test_peak_mask = (test_data["Last_Signal"] == 1) | (test_data["Last_Signal"] == 0)
+            if test_peak_mask.sum() > 0:
+                X_test_peak = test_data.loc[test_peak_mask, self.peak_features]
+                y_test_peak = test_data.loc[test_peak_mask, "Label_Peak"]
+                
+                preds = self.peak_model.predict(X_test_peak)
+                metrics["peak"]["precision"] = precision_score(y_test_peak, preds, zero_division=0)
+                metrics["peak"]["recall"] = recall_score(y_test_peak, preds, zero_division=0)
+                metrics["peak"]["accuracy"] = accuracy_score(y_test_peak, preds)
+            else:
+                metrics["peak"] = {"precision": 0, "recall": 0, "accuracy": 0}
         
-        # Test Data Generation
-        split_idx = int(len(data) * 0.70)
-        test_data = data.iloc[split_idx:].copy()
-        
+        # Add predictions to the test set for visual verification
         if not test_data.empty:
             test_data = self.add_predictions_to_df(test_data)
             test_data = test_data.rename(columns={
@@ -234,17 +293,25 @@ class MLEngine:
         """
         Returns a DataFrame of feature importances for both models.
         """
-        importances = pd.DataFrame(index=self.features)
+        # Create a combined index of all unique features
+        all_unique_features = sorted(list(set(self.dip_features + self.peak_features)))
+        importances = pd.DataFrame(index=all_unique_features)
+        
+        importances["Dip_Importance"] = 0.0
+        importances["Peak_Importance"] = 0.0
         
         if hasattr(self.dip_model, "feature_importances_"):
-            importances["Dip_Importance"] = self.dip_model.feature_importances_
-        else:
-            importances["Dip_Importance"] = 0.0
+            # Map dip importances to the correct rows
+            dip_imps = self.dip_model.feature_importances_
+            # Create series
+            dip_s = pd.Series(dip_imps, index=self.dip_features)
+            importances["Dip_Importance"] = importances.index.map(dip_s).fillna(0)
             
         if hasattr(self.peak_model, "feature_importances_"):
-            importances["Peak_Importance"] = self.peak_model.feature_importances_
-        else:
-            importances["Peak_Importance"] = 0.0
+            # Map peak importances to correct rows
+            peak_imps = self.peak_model.feature_importances_
+            peak_s = pd.Series(peak_imps, index=self.peak_features)
+            importances["Peak_Importance"] = importances.index.map(peak_s).fillna(0)
             
         return importances
 
@@ -254,25 +321,16 @@ class MLEngine:
             # Construct feature vector
             input_data = pd.DataFrame([current_row], columns=current_row.index)
             
-            for col in self.features:
+            for col in self.all_features:
                 if col not in input_data.columns:
                     input_data[col] = 0
             
-            X_new = input_data[self.features].fillna(0)
+            # Predict probabilities WITHOUT state gating to allow raw signal visibility
+            X_dip = input_data[self.dip_features].fillna(0)
+            p_dip = self.dip_model.predict_proba(X_dip)[0][1]
             
-            # Check STATE
-            last_signal = current_row.get("Last_Signal", 0)
-            
-            p_dip = 0.0
-            p_peak = 0.0
-            
-            # Predict Dip ONLY if last was Peak (-1) or Unknown (0)
-            if last_signal in [-1, 0]:
-                p_dip = self.dip_model.predict_proba(X_new)[0][1]
-                
-            # Predict Peak ONLY if last was Dip (1) or Unknown (0)
-            if last_signal in [1, 0]:
-                p_peak = self.peak_model.predict_proba(X_new)[0][1]
+            X_peak = input_data[self.peak_features].fillna(0)
+            p_peak = self.peak_model.predict_proba(X_peak)[0][1]
             
             return p_dip, p_peak
         except Exception as e:
@@ -285,30 +343,34 @@ class MLEngine:
         scan_df = df.copy()
         
         # Feature check
-        for col in self.features:
+        for col in self.all_features:
             if col not in scan_df.columns:
                 scan_df[col] = 0
-        scan_df[self.features] = scan_df[self.features].fillna(0)
+        scan_df[self.all_features] = scan_df[self.all_features].fillna(0)
         
         # If 'Last_Signal' is missing in future data (e.g. forecast), we must forward fill it from history
         if "Last_Signal" in scan_df.columns:
              scan_df["Last_Signal"] = scan_df["Last_Signal"].replace(0, np.nan).ffill().fillna(0)
         
         try:
-            # 1. Base Probabilities
-            dip_probs = self.dip_model.predict_proba(scan_df[self.features])[:, 1]
-            peak_probs = self.peak_model.predict_proba(scan_df[self.features])[:, 1]
+            # 1. Base Probabilities (Use correct features per model)
+            dip_probs = self.dip_model.predict_proba(scan_df[self.dip_features])[:, 1]
+            peak_probs = self.peak_model.predict_proba(scan_df[self.peak_features])[:, 1]
+            rsi_vals = scan_df["rsi_14"] if "rsi_14" in scan_df.columns else (scan_df["RSI"] if "RSI" in scan_df.columns else 50)
             
-            # 2. Apply State Filter Vectorized
-            if "Last_Signal" in scan_df.columns:
-                last_signals = scan_df["Last_Signal"].values
-                # If Last=1 (Dip), Prob_Dip -> 0
-                dip_probs = np.where(last_signals == 1, 0.0, dip_probs)
-                # If Last=-1 (Peak), Prob_Peak -> 0
-                peak_probs = np.where(last_signals == -1, 0.0, peak_probs)
+            # 2. Purity Logic for binary signals (Strict Mode)
+            # Peak: Prob >= 0.85 and (Peak% - Dip%) > RSI * 0.48
+            peak_gap = (peak_probs - dip_probs) * 100
+            peak_threshold = rsi_vals * 0.48
+            is_pure_peak = (peak_probs >= 0.85) & (peak_gap > peak_threshold)
             
-            df["AI_Dip"] = (dip_probs >= threshold).astype(int)
-            df["AI_Peak"] = (peak_probs >= threshold).astype(int)
+            # Dip: Hybrid Logic (85%|1.1x OR 72%|1.3x)
+            dip_gap = (dip_probs - peak_probs) * 100
+            is_pure_dip = ((dip_probs >= 0.85) & (dip_gap > rsi_vals * 1.1)) | \
+                          ((dip_probs >= 0.72) & (dip_gap > rsi_vals * 1.3))
+
+            df["AI_Dip"] = is_pure_dip.astype(int)
+            df["AI_Peak"] = is_pure_peak.astype(int)
             df["AI_Dip_Prob"] = dip_probs
             df["AI_Peak_Prob"] = peak_probs
             

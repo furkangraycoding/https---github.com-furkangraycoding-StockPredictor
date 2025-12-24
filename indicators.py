@@ -270,12 +270,32 @@ class TechnicalAnalyzer:
         return self.df
     
     def add_rsi_features(self):
-        """Calculates RSI changes."""
+        """Calculates RSI changes and Overbought Duration."""
         if "RSI" not in self.df.columns: self.add_rsi()
         
         self.df["RSI_Diff_1D"] = self.df["RSI"].diff(1)
         self.df["RSI_Diff_3D"] = self.df["RSI"].diff(3)
+        
+        # Calculate consecutive days in Overbought zone (>70)
+        # This helps the model wait for the Statistical Peak (~5 days)
+        is_ob = (self.df["RSI"] > 70).astype(int)
+        grouper = (is_ob != is_ob.shift()).cumsum()
+        self.df["RSI_Overbought_Days"] = is_ob.groupby(grouper).cumsum()
+        
         return self.df
+
+    def add_divergence_features(self, window: int = 14):
+        """
+        Calculates rolling correlation between Price and RSI.
+        Negative correlation during uptrend = Bearish Divergence (Peak Warning).
+        """
+        if "RSI" not in self.df.columns: self.add_rsi()
+        
+        # Pearson correlation over rolling window
+        # We handle NaN by filling with 0 or forward fill in downstream
+        self.df[f"RSI_Price_Corr_{window}"] = self.df[self.price_col].rolling(window).corr(self.df["RSI"])
+        return self.df
+
 
     def add_time_features(self):
         """Calculates days since the last pivot (Dip or Peak)."""
@@ -299,10 +319,20 @@ class TechnicalAnalyzer:
         last_pivot_date = pivot_dates.ffill()
         
         # Calculate diff in days
-        # Ensure types match
         try:
             time_diff = (dates - last_pivot_date).dt.days
             self.df["Days_Since_Last_Pivot"] = time_diff.fillna(0)
+            
+            # -----------------------------------------------------
+            # NEW: LEG RETURN (Price change since last confirmed pivot)
+            # -----------------------------------------------------
+            # Combine Dip and Tepe into a single 'Last_Pivot_Price' column
+            pivot_prices = self.df["Dip"].combine_first(self.df["Tepe"])
+            last_pivot_price = pivot_prices.ffill()
+            
+            # Leg Return = (Current Price - Last Pivot Price) / Last Pivot Price
+            self.df["Leg_Return"] = (self.df[self.price_col] - last_pivot_price) / last_pivot_price
+            self.df["Leg_Return"] = self.df["Leg_Return"].fillna(0)
             
             # NEW: Cycle Phase (Dynamic Binning)
             # Uptrend Avg = 31 days, Downtrend Avg = 19 days
@@ -362,8 +392,10 @@ class TechnicalAnalyzer:
         self.df["Kurtosis_20"] = self.df[self.price_col].pct_change().rolling(20).kurt()
         
         # 4. Fractal signals (Higher/Lower extremes in window)
-        self.df["Fractal_High"] = self.df["high"].rolling(5, center=True).max() == self.df["high"]
-        self.df["Fractal_Low"] = self.df["low"].rolling(5, center=True).min() == self.df["low"]
+        # 4. Fractal signals (Higher/Lower extremes in window)
+        # changed center=True to False to prevent look-ahead bias
+        self.df["Fractal_High"] = self.df["high"].rolling(5).max() == self.df["high"]
+        self.df["Fractal_Low"] = self.df["low"].rolling(5).min() == self.df["low"]
         
         return self.df
 
@@ -389,6 +421,7 @@ class TechnicalAnalyzer:
         # NEW: RSI & Time Features
         self.add_rsi_features()
         self.add_time_features()
+        self.add_divergence_features() # Divergence Check
         
         # NEW: Advanced Optimization Features
         self.add_advanced_stats()

@@ -140,7 +140,7 @@ else:
 # =====================================================
 # DATA WINDOWING & FUTURE PROJECTION (PAST + FUTURE)
 # =====================================================
-# Window: [selected_date - months_lookback] TO [selected_date + 30 days]
+# Window: [selected_date - months_lookback] TO [selected_date + 7 days]
 window_start = selected_date - pd.DateOffset(months=months_lookback)
 
 # Base window from existing data (Simulated History)
@@ -149,10 +149,14 @@ df_window = df_analyzed[
     (df_analyzed[DATE_COL] <= selected_date)
 ].copy()
 
+# ENRICH HISTORY WITH AI PREDICTIONS
+# We need this to check "Persistence" (Last 5 days signals)
+df_window = ml_engine.add_predictions_to_df(df_window)
+
 # FUTURE PROJECTION: If we are at the end or want to see what's next
 with st.spinner("Generating AI Future Forecast..."):
     # 1. Project price forward
-    df_forecast = ml_engine.forecast_future(df_analyzed, days=30)
+    df_forecast = ml_engine.forecast_future(df_analyzed, days=7)
     
     if not df_forecast.empty:
         # 2. Combine with enough history to recalculate indicators (e.g., last 200 days)
@@ -194,52 +198,39 @@ with st.spinner("Generating AI Future Forecast..."):
         # Update window for display
         df_window = pd.concat([df_window, df_forecast_enriched], ignore_index=True)
 
-# 2. Get probabilities for specifically the "Selected Date" (The present moment)
-# This is for the Gauges and Insights
-try:
-    target_row = df_analyzed.iloc[-1]
-    dip_prob, peak_prob = ml_engine.predict_probs(target_row)
-except:
-    dip_prob, peak_prob = 0.0, 0.0
 
 # =====================================================
 # UI RENDERING (Simplified)
 # =====================================================
 render_header()
 
+# CRITICAL: We separate HISTORY from FORECAST for current status analysis
+if "is_forecast" in df_window.columns:
+    # History rows will be NaN or False, Forecast rows will be True
+    df_history_only = df_window[df_window["is_forecast"].fillna(False) == False]
+else:
+    df_history_only = df_window
+
+# 2. Get probabilities for specifically the "Selected Date" (The present moment)
+# This is for the Gauges and Insights
+try:
+    # Use the last row of df_history_only which corresponds to the selected_date
+    target_row = df_history_only.iloc[-1]
+    dip_prob, peak_prob = ml_engine.predict_probs(target_row)
+except:
+    dip_prob, peak_prob = 0.0, 0.0
+
+# KPI Summary
+render_kpi_metrics(df_history_only, dip_prob, peak_prob, 
+                   metrics['dip'].get('accuracy', 0), 
+                   metrics['peak'].get('accuracy', 0))
+
 # Full-width Chart with AI Predictions
 st.subheader("📊 BIST100 + AI Predictions")
 render_plotly_chart(df_window, DATE_COL, selected_date=selected_date)
 
-# Current Status (Simple)
-# 1. Historical Fact Check (Did this actually turn out to be a Dip/Peak?)
-is_actual_dip = pd.notna(target_row.get("Dip"))
-is_actual_peak = pd.notna(target_row.get("Tepe"))
-
-if is_actual_dip:
-    st.info(f"✅ **Doğrulanmış Bilgi**: Bu tarih geçmişte **DİP** olarak teyit edilmiştir. (Model Tespiti: %{dip_prob*100:.0f})")
-elif is_actual_peak:
-    st.info(f"✅ **Doğrulanmış Bilgi**: Bu tarih geçmişte **TEPE** olarak teyit edilmiştir. (Model Tespiti: %{peak_prob*100:.0f})")
-
-# 2. AI Prediction (If not looking at a historical fact, or just to show confidence)
-elif dip_prob > 0.50:
-    st.success(f"🟢 **AI BUY Signal Today**: Dip Probability = %{dip_prob*100:.0f}")
-elif peak_prob > 0.50:
-    st.error(f"🔴 **AI SELL Signal Today**: Peak Probability = %{peak_prob*100:.0f}")
-else:
-    # Smart "Trend Continuation" Logic
-    last_sig = target_row.get("Last_Signal", 0)
-    
-    # If we are in an Uptrend (Last=Dip) and Peak probability is very low, it means "Hold / Continue"
-    if last_sig == 1 and peak_prob < 0.20:
-         st.success(f"📈 **Yükseliş Trendi Devam Ediyor**: Tepe (Satış) Sinyali Yok. (Peak Prob: %{peak_prob*100:.0f})")
-         
-    # If we are in a Downtrend (Last=Peak) and Dip probability is very low, it means "Wait / Continue"
-    elif last_sig == -1 and dip_prob < 0.20:
-         st.error(f"📉 **Düşüş Trendi Devam Ediyor**: Dip (Alış) Sinyali Yok. (Dip Prob: %{dip_prob*100:.0f})")
-         
-    else:
-        st.info(f"⚪ **Güçlü Sinyal Yok**: Dip=%{dip_prob*100:.0f}, Peak=%{peak_prob*100:.0f}")
+# AI Insights (The colored warning boxes)
+render_ai_insights(df_history_only, dip_prob, peak_prob)
 
 # =====================================================
 # FUTURE PREDICTIONS LIST
@@ -273,7 +264,7 @@ else:
         # But for the TABLE, we just add this row.
         signals_list.append({
             "Tarih": best_dip[DATE_COL].strftime("%d/%m/%Y"),
-            "Sinyal": "🟢 PREDICTED DIP (En Güçlü)",
+            "Sinyal": "🟢 TAHMİNİ DİP (En Güçlü)",
             "Fiyat": f"{best_dip['price']:,.2f}",
             "Olasılık": f"%{best_dip['AI_Dip_Prob']*100:.0f}"
         })
@@ -281,7 +272,7 @@ else:
     if best_peak is not None and best_peak["AI_Peak_Prob"] > 0.05:
         signals_list.append({
             "Tarih": best_peak[DATE_COL].strftime("%d/%m/%Y"),
-            "Sinyal": "🔴 PREDICTED PEAK (En Güçlü)",
+            "Sinyal": "🔴 POTANSİYEL ZİRVE (5 Gün İçinde Hedef)",
             "Fiyat": f"{best_peak['price']:,.2f}",
             "Olasılık": f"%{best_peak['AI_Peak_Prob']*100:.0f}"
         })
@@ -299,7 +290,7 @@ else:
         if best_peak is not None:
              summary_parts.append(f"PEAK: {best_peak[DATE_COL].strftime('%d/%m')} (Conf: %{best_peak['AI_Peak_Prob']*100:.0f})")
              
-        st.success(f"Gelecek 30 Gün İçin En Güçlü Tahminler:\n" + ", ".join(summary_parts))
+        st.success(f"Gelecek 7 Gün İçin En Güçlü Tahminler:\n" + ", ".join(summary_parts))
 
 # =====================================================
 # MODEL INSIGHTS (Feature Importance & Accuracy)
